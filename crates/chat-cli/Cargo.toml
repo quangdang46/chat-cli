@@ -1,0 +1,21 @@
+[package]
+name = "chat-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for chatting with ChatGPT/DeepSeek web via terminal"
+
+[[bin]]
+name = "chat-cli"
+path = "src/main.rs"
+
+[dependencies]
+chat-core = { workspace = true }
+provider-chatgpt = { workspace = true }
+provider-deepseek = { workspace = true }
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+inventory.workspace = true
+serde_json.workspace = true
+chrono.workspace = true

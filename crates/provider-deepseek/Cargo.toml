@@ -1,0 +1,18 @@
+[package]
+name = "provider-deepseek"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DeepSeek web provider for chat-cli (session, completion)"
+
+[dependencies]
+chat-core = { workspace = true }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+inventory.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
