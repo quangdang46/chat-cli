@@ -48,12 +48,12 @@ chat-cli -p "tear this plan apart" -a ./PLAN.md --provider chatgpt
 
 | Capability | `chat-cli` | ChatGPT web | OpenAI / Codex CLI |
 |---|---:|---|---:|
-| One-command plan review (`-a ./PLAN.md`) | ✅ ` -a` + glob + `@list` + stdin | ❌ manual upload + paste | ⚠️ single-provider, no web-session reuse |
-| Works for agents (non-interactive, no browser) | ✅ `--token` + pipeable `stdout` | ❌ needs a headed browser | ⚠️ API keys only, not web sessions |
+| One-command plan review (`-a ./PLAN.md`) | ✅ ` -a` + glob + `@list` + stdin | ❌ manual upload + paste | ⚠️ shares ChatGPT quota, but OpenAI-only — no multi-provider |
+| Works for agents (non-interactive, no browser) | ✅ `--token` + pipeable `stdout` | ❌ needs a headed browser | ✅ shares ChatGPT quota, headless — but OpenAI-only |
 | Local history you can list, branch, and grep | ✅ `history list/show/rm`, `--new` / `--continue <id>` | ⚠️ browser sidebar only | ❌ server-side only |
 | Provider switch without touching core | ✅ `crates/provider-*` + `Provider` trait + inventory registry | ❌ N/A | ❌ one backend |
-| Token that feels permanent | ✅ manual paste once, rolling 30-day refresh | ⚠️ automatic but browser-bound | ❌ key rotation is manual |
-| File context that survives provider differences | ✅ `prepare_attachments()` overridable per provider | ❌ per-site upload quirks | ❌ token-only context |
+| Token that feels permanent | ✅ manual paste once, rolling 30-day refresh | ⚠️ automatic but browser-bound | ✅ shared ChatGPT session (same quota) |
+| File context that survives provider differences | ✅ `prepare_attachments()` overridable per provider | ❌ per-site upload quirks | ⚠️ OpenAI file tool only |
 
 ---
 
@@ -261,7 +261,7 @@ cargo new crates/provider-gemini --lib
 The tab is fine for one-off questions. For an agent that needs to call `chat-cli -p "review PLAN.md" -a PLAN.md --provider chatgpt` a hundred times, a browser is a liability: it needs a window, a human, and manual file uploads. `chat-cli` does it headless and pipeably.
 
 **Why not just use Codex / the OpenAI API?**
-Codex and the API are single-backend and API-key based. `chat-cli` reuses your existing ChatGPT web session (the one you already pay for) and is multi-provider by design — DeepSeek today, Gemini/Claude next — without rewriting core. The `Provider` trait + `crates/provider-*` layout is built for that.
+Codex already shares your ChatGPT quota (same web-session billing, not a separate API key bill), so quota isn't the differentiator — **breadth is**. Codex is OpenAI-only. `chat-cli` is multi-provider by design — DeepSeek today, Gemini/Claude next — behind the same `Provider` trait + `crates/provider-*` layout, so you can switch backends without rewriting core.
 
 **How is the browser session kept alive?**
 The CLI stores the pasted `session_token` in `config.toml` and, before each chat, does the same rolling refresh the browser does: `GET /api/auth/session` → cache the short-lived `access_token` → persist any new `Set-Cookie` value. There is no background daemon; the next chat does the refresh.
