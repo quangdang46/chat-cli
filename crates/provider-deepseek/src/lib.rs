@@ -1,7 +1,6 @@
 pub mod protocol;
 
 use chat_core::provider::{ChatReq, ChatResp, Provider, ProviderHandle, Session};
-use inventory;
 
 // TODO: implement DeepSeek web provider
 // - auth(): validate token via DeepSeek API
