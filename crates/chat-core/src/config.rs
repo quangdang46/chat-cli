@@ -80,3 +80,144 @@ impl Config {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("chatgpt".to_string());
+        cfg.providers.insert(
+            "chatgpt".to_string(),
+            ProviderConfig {
+                session_token: Some("session-token-1".to_string()),
+                access_token: Some("access-token-1".to_string()),
+                access_token_expiry: Some("2026-09-01T00:00:00Z".to_string()),
+            },
+        );
+        cfg.providers.insert(
+            "deepseek".to_string(),
+            ProviderConfig {
+                session_token: Some("ds-token".to_string()),
+                access_token: None,
+                access_token_expiry: None,
+            },
+        );
+        cfg
+    }
+
+    #[test]
+    fn load_missing_file_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert!(cfg.default_provider.is_none());
+        assert!(cfg.providers.is_empty());
+    }
+
+    #[test]
+    fn save_and_reload_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = sample_config();
+        cfg.save(Some(&path)).unwrap();
+
+        let loaded = Config::load(Some(&path)).unwrap();
+        assert_eq!(loaded.default_provider.as_deref(), Some("chatgpt"));
+        assert_eq!(loaded.providers.len(), 2);
+
+        let chatgpt = loaded.providers.get("chatgpt").unwrap();
+        assert_eq!(chatgpt.session_token.as_deref(), Some("session-token-1"));
+        assert_eq!(chatgpt.access_token.as_deref(), Some("access-token-1"));
+        assert_eq!(
+            chatgpt.access_token_expiry.as_deref(),
+            Some("2026-09-01T00:00:00Z")
+        );
+
+        let deepseek = loaded.providers.get("deepseek").unwrap();
+        assert_eq!(deepseek.session_token.as_deref(), Some("ds-token"));
+        assert!(deepseek.access_token.is_none());
+    }
+
+    #[test]
+    fn ensure_default_provider_first_login_sets_it() {
+        let mut cfg = Config::default();
+        cfg.ensure_default_provider("deepseek");
+        assert_eq!(cfg.default_provider.as_deref(), Some("deepseek"));
+    }
+
+    #[test]
+    fn ensure_default_provider_second_login_does_not_override() {
+        let mut cfg = Config::default();
+        cfg.ensure_default_provider("deepseek");
+        // A later login to another provider must not steal the default.
+        cfg.ensure_default_provider("chatgpt");
+        cfg.ensure_default_provider("chatgpt");
+        assert_eq!(
+            cfg.default_provider.as_deref(),
+            Some("deepseek"),
+            "first-login-only semantics violated"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_config_has_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sample_config().save(Some(&path)).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "config holds secrets and must be 0600");
+    }
+
+    #[test]
+    fn save_creates_missing_parent_dirs_and_leaves_no_tmp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("deeper").join("config.toml");
+        sample_config().save(Some(&path)).unwrap();
+
+        assert!(path.exists());
+        let tmp = path.with_extension("toml.tmp");
+        assert!(!tmp.exists(), "atomic rename must consume the temp file");
+
+        let loaded = Config::load(Some(&path)).unwrap();
+        assert_eq!(loaded.default_provider.as_deref(), Some("chatgpt"));
+    }
+
+    #[test]
+    fn override_path_is_used_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("ci").join("custom.toml");
+
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("deepseek".to_string());
+        cfg.save(Some(&custom)).unwrap();
+
+        assert_eq!(
+            Config::load(Some(&custom))
+                .unwrap()
+                .default_provider
+                .as_deref(),
+            Some("deepseek")
+        );
+        // The real user config location is untouched.
+        assert!(!dir.path().join("config.toml").exists());
+    }
+
+    #[test]
+    fn reload_overwrites_previous_values_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut cfg = sample_config();
+        cfg.save(Some(&path)).unwrap();
+
+        cfg.default_provider = Some("deepseek".to_string());
+        cfg.save(Some(&path)).unwrap();
+
+        let loaded = Config::load(Some(&path)).unwrap();
+        assert_eq!(loaded.default_provider.as_deref(), Some("deepseek"));
+    }
+}

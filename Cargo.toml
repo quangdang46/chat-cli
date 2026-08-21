@@ -30,6 +30,7 @@ inventory = "0.3"
 thiserror = "2.0"
 base64 = "0.22"
 sha3 = "0.10"
+tempfile = "3"
 chat-core = { path = "crates/chat-core" }
 provider-chatgpt = { path = "crates/provider-chatgpt" }
 provider-deepseek = { path = "crates/provider-deepseek" }
