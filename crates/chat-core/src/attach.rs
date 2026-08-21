@@ -290,7 +290,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = write_file(dir.path(), "a.md", "content A");
 
-        let out = default_prepare_attachments(&[a.clone()]).unwrap();
+        let out = default_prepare_attachments(std::slice::from_ref(&a)).unwrap();
         let expected = format!("<<<FILE: {}>>>\n```\ncontent A\n```\n\n", a.display());
         assert_eq!(out, expected);
     }
@@ -349,7 +349,7 @@ mod tests {
         let bin = dir.path().join("binary.bin");
         std::fs::write(&bin, [0xFF, 0xFE, 0x00, 0xC0]).unwrap();
 
-        let err = default_prepare_attachments(&[bin.clone()]).unwrap_err();
+        let err = default_prepare_attachments(std::slice::from_ref(&bin)).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("UTF-8"), "{msg}");
         assert!(msg.contains(bin.display().to_string().as_str()), "{msg}");

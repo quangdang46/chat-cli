@@ -86,8 +86,10 @@ mod tests {
     use super::*;
 
     fn sample_config() -> Config {
-        let mut cfg = Config::default();
-        cfg.default_provider = Some("chatgpt".to_string());
+        let mut cfg = Config {
+            default_provider: Some("chatgpt".to_string()),
+            ..Default::default()
+        };
         cfg.providers.insert(
             "chatgpt".to_string(),
             ProviderConfig {
@@ -191,8 +193,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let custom = dir.path().join("ci").join("custom.toml");
 
-        let mut cfg = Config::default();
-        cfg.default_provider = Some("deepseek".to_string());
+        let cfg = Config {
+            default_provider: Some("deepseek".to_string()),
+            ..Default::default()
+        };
         cfg.save(Some(&custom)).unwrap();
 
         assert_eq!(
