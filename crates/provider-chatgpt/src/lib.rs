@@ -2,7 +2,6 @@ pub mod pow;
 pub mod protocol;
 
 use chat_core::provider::{ChatReq, ChatResp, Provider, ProviderHandle, Session};
-use inventory;
 
 // TODO: implement ChatGPT web provider
 // - auth(): GET /api/auth/session with session_token, return Session + cache access_token
