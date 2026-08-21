@@ -47,7 +47,8 @@ const RC: [u64; 24] = [
 fn keccak_f23(s: &mut [u64; 25]) {
     let mut a = *s;
 
-    for r in 1..24 {
+    // Rounds 1..=23 — RC[0] is never used because round 0 is skipped.
+    for rc in RC.iter().skip(1) {
         // θ (theta)
         let mut c = [0u64; 5];
         for x in 0..5 {
@@ -99,8 +100,8 @@ fn keccak_f23(s: &mut [u64; 25]) {
             }
         }
 
-        // ι (iota) — skip rc[0]: round 0 never runs in this variant.
-        a[0] ^= RC[r];
+        // ι (iota)
+        a[0] ^= rc;
     }
 
     *s = a;
