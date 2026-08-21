@@ -8,7 +8,7 @@
 //!   cat PLAN.md | chat-cli -p "..." (stdin auto-attachment if no -a)
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const MAX_FILE_BYTES: u64 = 1_000_000; // 1 MB per file
 const MAX_TOTAL_BYTES: u64 = 5_000_000; // 5 MB total
@@ -54,7 +54,9 @@ pub fn resolve_attachments(raw: &[String]) -> anyhow::Result<Vec<PathBuf>> {
 fn expand_glob_or_push(pattern: &str, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
     if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
         let mut matched = false;
-        for entry in glob::glob(pattern).map_err(|e| anyhow::anyhow!("invalid glob '{}': {}", pattern, e))? {
+        for entry in
+            glob::glob(pattern).map_err(|e| anyhow::anyhow!("invalid glob '{}': {}", pattern, e))?
+        {
             let path = entry.map_err(|e| anyhow::anyhow!("glob entry error: {}", e))?;
             out.push(path);
             matched = true;
@@ -126,7 +128,11 @@ pub fn maybe_read_stdin_as_attachment(has_attachments: bool) -> anyhow::Result<S
         return Ok(String::new());
     }
     if buf.len() as u64 > MAX_TOTAL_BYTES {
-        anyhow::bail!("stdin too large ({} bytes > {} limit)", buf.len(), MAX_TOTAL_BYTES);
+        anyhow::bail!(
+            "stdin too large ({} bytes > {} limit)",
+            buf.len(),
+            MAX_TOTAL_BYTES
+        );
     }
     Ok(format!("<<<FILE: stdin>>>\n```\n{}\n```\n\n", buf))
 }
