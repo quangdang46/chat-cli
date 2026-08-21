@@ -124,6 +124,11 @@ pub fn maybe_read_stdin_as_attachment(has_attachments: bool) -> anyhow::Result<S
     let mut buf = String::new();
     use std::io::Read;
     std::io::stdin().read_to_string(&mut buf)?;
+    build_stdin_attachment(buf)
+}
+
+/// Pure core of stdin handling — unit-testable without controlling the real stdin.
+fn build_stdin_attachment(buf: String) -> anyhow::Result<String> {
     if buf.trim().is_empty() {
         return Ok(String::new());
     }
@@ -148,5 +153,235 @@ fn atty_check() -> bool {
     #[cfg(not(unix))]
     {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn write_file(dir: &Path, name: &str, content: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn repeated_flag_entries_resolve_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_file(dir.path(), "a.md", "A");
+        let b = write_file(dir.path(), "b.md", "B");
+        let raw = vec![
+            a.to_string_lossy().to_string(),
+            b.to_string_lossy().to_string(),
+        ];
+        let out = resolve_attachments(&raw).unwrap();
+        assert_eq!(out, vec![a, b]);
+    }
+
+    #[test]
+    fn comma_separated_single_flag_expands() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_file(dir.path(), "a.md", "A");
+        let b = write_file(dir.path(), "b.md", "B");
+        let combined = format!("{},{}", a.display(), b.display());
+        let out = resolve_attachments(&[combined]).unwrap();
+        assert_eq!(out, vec![a, b]);
+    }
+
+    #[test]
+    fn at_list_file_supports_comments_and_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_file(dir.path(), "a.md", "A");
+        let b = write_file(dir.path(), "b.md", "B");
+        let list = format!("# comment line\n\n{}\n  \n{}\n", a.display(), b.display());
+        let list_path = write_file(dir.path(), "list.txt", &list);
+
+        let out = resolve_attachments(&[format!("@{}", list_path.display())]).unwrap();
+        assert_eq!(out, vec![a, b]);
+    }
+
+    #[test]
+    fn at_list_missing_file_bails_with_clear_error() {
+        let err = resolve_attachments(&["@/nonexistent/path/list.txt".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("failed to read file list"));
+    }
+
+    #[test]
+    fn glob_pattern_matches_and_skips_subdirs_extension_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "x.rs", "fn main() {}");
+        write_file(dir.path(), "y.rs", "fn other() {}");
+        write_file(dir.path(), "z.md", "not rust");
+
+        let pattern = format!("{}/*.rs", dir.path().display());
+        let mut out = resolve_attachments(&[pattern]).unwrap();
+        out.sort();
+        assert_eq!(out.len(), 2);
+        assert!(out
+            .iter()
+            .all(|p| p.extension().and_then(|e| e.to_str()) == Some("rs")));
+    }
+
+    #[test]
+    fn recursive_glob_matches_nested_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("src").join("deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        write_file(nested.as_path(), "inner.rs", "mod inner;");
+
+        let pattern = format!("{}/**/*.rs", dir.path().display());
+        let out = resolve_attachments(&[pattern]).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].ends_with("inner.rs"));
+    }
+
+    #[test]
+    fn glob_matching_nothing_bails_with_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let pattern = format!("{}/*.nope", dir.path().display());
+        let err = resolve_attachments(&[pattern]).unwrap_err();
+        assert!(err.to_string().contains("matched no files"));
+    }
+
+    #[test]
+    fn plain_path_that_does_not_exist_bails() {
+        let err = resolve_attachments(&["/nonexistent/file.md".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("attachment not found"));
+    }
+
+    #[test]
+    fn dedup_preserves_first_occurrence_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_file(dir.path(), "a.md", "A");
+        let b = write_file(dir.path(), "b.md", "B");
+
+        // Same file reached twice via repeat + comma must appear once, in order.
+        let raw = vec![
+            a.to_string_lossy().to_string(),
+            format!("{},{}", b.display(), a.display()),
+        ];
+        let out = resolve_attachments(&raw).unwrap();
+        assert_eq!(out, vec![a, b]);
+    }
+
+    #[test]
+    fn empty_and_whitespace_entries_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_file(dir.path(), "a.md", "A");
+        let raw = vec![
+            String::new(),
+            "   ".to_string(),
+            ",".to_string(),
+            a.to_string_lossy().to_string(),
+        ];
+        let out = resolve_attachments(&raw).unwrap();
+        assert_eq!(out, vec![a]);
+    }
+
+    #[test]
+    fn default_prepare_empty_slice_is_empty_string() {
+        assert_eq!(default_prepare_attachments(&[]).unwrap(), "");
+    }
+
+    #[test]
+    fn default_prepare_injects_file_fences() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_file(dir.path(), "a.md", "content A");
+
+        let out = default_prepare_attachments(&[a.clone()]).unwrap();
+        let expected = format!("<<<FILE: {}>>>\n```\ncontent A\n```\n\n", a.display());
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn default_prepare_multiple_files_concatenates_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_file(dir.path(), "a.md", "AAA-content");
+        let b = write_file(dir.path(), "b.md", "BBB-content");
+
+        let out = default_prepare_attachments(&[a.clone(), b.clone()]).unwrap();
+        let fence_a = format!("<<<FILE: {}>>>", a.display());
+        let fence_b = format!("<<<FILE: {}>>>", b.display());
+        assert!(out.contains(&fence_a));
+        assert!(out.contains(&fence_b));
+        assert!(
+            out.find(&fence_a).unwrap() < out.find(&fence_b).unwrap(),
+            "files must be injected in argument order"
+        );
+        assert!(out.find("AAA-content").unwrap() < out.find("BBB-content").unwrap());
+    }
+
+    #[test]
+    fn per_file_guard_rejects_over_1mb() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.txt");
+        std::fs::write(&big, vec![b'x'; MAX_FILE_BYTES as usize + 1]).unwrap();
+
+        let err = default_prepare_attachments(&[big]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("too large"), "{msg}");
+        assert!(msg.contains("1000000"), "should name the limit: {msg}");
+    }
+
+    #[test]
+    fn total_guard_rejects_over_5mb_across_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // Six files of ~900KB each: every one under the 1MB per-file guard,
+        // but together over the 5MB total guard.
+        let chunk = vec![b'a'; 900_000];
+        let files: Vec<PathBuf> = (0..6)
+            .map(|i| {
+                let p = dir.path().join(format!("chunk{i}.txt"));
+                std::fs::write(&p, &chunk).unwrap();
+                p
+            })
+            .collect();
+
+        let err = default_prepare_attachments(&files).unwrap_err();
+        assert!(err.to_string().contains("total attachments too large"));
+    }
+
+    #[test]
+    fn non_utf8_file_bails_with_path_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("binary.bin");
+        std::fs::write(&bin, [0xFF, 0xFE, 0x00, 0xC0]).unwrap();
+
+        let err = default_prepare_attachments(&[bin.clone()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("UTF-8"), "{msg}");
+        assert!(msg.contains(bin.display().to_string().as_str()), "{msg}");
+    }
+
+    #[test]
+    fn missing_file_stat_bails() {
+        let err = default_prepare_attachments(&[PathBuf::from("/nonexistent/f.md")]).unwrap_err();
+        assert!(err.to_string().contains("cannot stat"));
+    }
+
+    #[test]
+    fn stdin_with_attachments_present_returns_empty_without_reading() {
+        // When -a was given, stdin must never be consumed.
+        assert_eq!(maybe_read_stdin_as_attachment(true).unwrap(), "");
+    }
+
+    #[test]
+    fn stdin_builder_wraps_piped_text_as_virtual_file() {
+        let out = build_stdin_attachment("piped plan content".to_string()).unwrap();
+        assert_eq!(out, "<<<FILE: stdin>>>\n```\npiped plan content\n```\n\n");
+    }
+
+    #[test]
+    fn stdin_builder_whitespace_only_is_empty() {
+        assert_eq!(build_stdin_attachment("   \n\t".to_string()).unwrap(), "");
+    }
+
+    #[test]
+    fn stdin_builder_rejects_over_total_limit() {
+        let big = "x".repeat(MAX_TOTAL_BYTES as usize + 1);
+        let err = build_stdin_attachment(big).unwrap_err();
+        assert!(err.to_string().contains("stdin too large"));
     }
 }
