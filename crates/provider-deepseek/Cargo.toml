@@ -6,6 +6,7 @@ license.workspace = true
 description = "DeepSeek web provider for chat-cli (session, completion)"
 
 [dependencies]
+deepseek-pow.workspace = true
 chat-core = { workspace = true }
 anyhow.workspace = true
 serde.workspace = true
@@ -16,3 +17,7 @@ inventory.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+mockito = "1"
+parking_lot.workspace = true

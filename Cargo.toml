@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/chat-core",
+    "crates/deepseek-pow",
     "crates/provider-chatgpt",
     "crates/provider-deepseek",
     "crates/chat-cli",
@@ -33,5 +34,6 @@ base64 = "0.22"
 sha3 = "0.10"
 tempfile = "3"
 chat-core = { path = "crates/chat-core" }
+deepseek-pow = { path = "crates/deepseek-pow" }
 provider-chatgpt = { path = "crates/provider-chatgpt" }
 provider-deepseek = { path = "crates/provider-deepseek" }

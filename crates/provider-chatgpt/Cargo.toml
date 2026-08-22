@@ -6,6 +6,7 @@ license.workspace = true
 description = "ChatGPT web provider for chat-cli (session refresh, PoW, conversation)"
 
 [dependencies]
+deepseek-pow.workspace = true
 chat-core = { workspace = true }
 anyhow.workspace = true
 serde.workspace = true

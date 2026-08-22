@@ -1,4 +1,4 @@
-pub mod pow;
+pub use deepseek_pow as pow;
 pub mod protocol;
 
 use std::time::Duration;
