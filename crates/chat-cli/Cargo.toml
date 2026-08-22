@@ -20,6 +20,7 @@ inventory.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 rpassword.workspace = true
+dirs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

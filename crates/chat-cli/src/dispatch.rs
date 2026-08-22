@@ -497,20 +497,19 @@ mod tests {
 
     static HOME_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-    /// Point HOME at a temp dir so `dirs::config_dir()`/`data_local_dir()`
-    /// resolve inside it. On macOS both map to `$HOME/Library/Application
-    /// Support`; on Linux to `$HOME/.config` and `$HOME/.local/share`.
+    /// Point HOME at a temp dir so `dirs::config_dir()` resolves inside it.
+    /// Ask `dirs` itself for the base (instead of hardcoding per-OS paths):
+    /// macOS → `$HOME/Library/Application Support`, Linux XDG → `$HOME/.config`.
     fn temp_env() -> TempEnv {
         let guard = HOME_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", dir.path());
-        let app_support = dir
-            .path()
-            .join("Library/Application Support")
+        let config_base = dirs::config_dir()
+            .expect("HOME is set so dirs::config_dir() must resolve")
             .join("chat-cli");
         TempEnv {
             _guard: guard,
-            config: app_support.join("config.toml"),
+            config: config_base.join("config.toml"),
             _dir: dir,
         }
     }
