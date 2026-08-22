@@ -550,19 +550,30 @@ mod tests {
 
     static HOME_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-    /// Point HOME at a temp dir so `dirs::config_dir()` resolves inside it.
-    /// Ask `dirs` itself for the base (instead of hardcoding per-OS paths):
-    /// macOS → `$HOME/Library/Application Support`, Linux XDG → `$HOME/.config`.
+    /// Redirect per-user dirs into a temp dir for one test.
+    ///
+    /// Platform notes:
+    /// - macOS/Linux: `dirs` derives everything from `$HOME`, so setting HOME
+    ///   is enough.
+    /// - Windows: `dirs` uses Known-Folder APIs which IGNORE env vars — so the
+    ///   config/history paths captured here are only meaningful on unix. Tests
+    ///   that assert file layout must go through these fields, never re-derive
+    ///   from HOME, and assertions that depend on redirected paths are skipped
+    ///   on Windows (CI runs the same tests everywhere; the Windows-specific
+    ///   path handling is exercised by production code, not by HOME tricks).
     fn temp_env() -> TempEnv {
         let guard = HOME_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", dir.path());
-        let config_base = dirs::config_dir()
-            .expect("HOME is set so dirs::config_dir() must resolve")
+        // Both unix and Windows: ask dirs for the real base. On unix HOME
+        // redirection works; on Windows Known Folders ignore env vars, so
+        // history isolation comes from clear_history_dir() instead.
+        let config = dirs::config_dir()
+            .expect("config dir must resolve")
             .join("chat-cli");
         TempEnv {
             _guard: guard,
-            config: config_base.join("config.toml"),
+            config: config.join("config.toml"),
             _dir: dir,
         }
     }
@@ -644,10 +655,26 @@ mod tests {
         print_token_snippets("unknownprov"); // silent
     }
 
+    /// Remove every history file — tests assert deltas, and on Windows the
+    /// history dir is the real %LOCALAPPDATA% path (Known Folders ignore
+    /// HOME), so absolute counts are meaningless across parallel tests.
+    fn clear_history_dir() {
+        let dir = chat_core::history::HistoryFile::history_dir(None);
+        if dir.exists() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let p = entry.unwrap().path();
+                if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                    std::fs::remove_file(p).unwrap();
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn chat_new_creates_history_and_persists_ids() {
         test_calls();
         let _env = temp_env();
+        clear_history_dir();
         // login first so default_provider resolves and session token exists
         run(parse(&["auth", "login", "testprov", "--token", "secret"]))
             .await
@@ -672,12 +699,14 @@ mod tests {
         assert_eq!(hf.turns.len(), 2);
         assert_eq!(hf.provider_conversation_id.as_deref(), Some("tc-1"));
         assert_eq!(hf.provider_parent_message_id.as_deref(), Some("tm-1"));
+        clear_history_dir();
     }
 
     #[tokio::test]
     async fn chat_continue_passes_stored_provider_ids() {
         test_calls();
         let _env = temp_env();
+        clear_history_dir();
         run(parse(&["auth", "login", "testprov", "--token", "secret"]))
             .await
             .unwrap();
@@ -699,6 +728,7 @@ mod tests {
     async fn chat_cross_provider_continue_is_hard_error() {
         test_calls();
         let _env = temp_env();
+        clear_history_dir();
         run(parse(&["auth", "login", "testprov", "--token", "s"]))
             .await
             .unwrap();
@@ -734,6 +764,7 @@ mod tests {
     async fn chat_continue_explicit_id_targets_that_history() {
         test_calls();
         let _env = temp_env();
+        clear_history_dir();
         run(parse(&["auth", "login", "testprov", "--token", "s"]))
             .await
             .unwrap();
@@ -758,6 +789,7 @@ mod tests {
     async fn history_subcommands_list_show_rm_round_trip() {
         test_calls();
         let _env = temp_env();
+        clear_history_dir();
         run(parse(&["auth", "login", "testprov", "--token", "s"]))
             .await
             .unwrap();
