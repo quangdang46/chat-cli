@@ -1,0 +1,87 @@
+name: Release
+on:
+  push:
+    tags: ["v*.*.*"]
+permissions:
+  contents: write
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            method: cross
+            suffix: linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            method: cross
+            suffix: linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            method: native
+            suffix: macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            method: native
+            suffix: macos-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            method: native
+            suffix: windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.method == 'cross'
+        run: cargo install cross --locked
+      - name: Build (cross)
+        if: matrix.method == 'cross'
+        run: cross build --release --workspace -p chat-cli --target ${{ matrix.target }}
+      - name: Build (native)
+        if: matrix.method == 'native'
+        run: cargo build --release --target ${{ matrix.target }} -p chat-cli
+      - name: Package (unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          BIN="target/${{ matrix.target }}/release/chat-cli"
+          file "$BIN"
+          tar -czf "chat-cli-${{ github.ref_name }}-${{ matrix.suffix }}.tar.gz" -C "target/${{ matrix.target }}/release" chat-cli
+          shasum -a 256 "chat-cli-${{ github.ref_name }}-${{ matrix.suffix }}.tar.gz" \
+            > "chat-cli-${{ github.ref_name }}-${{ matrix.suffix }}.tar.gz.sha256"
+      - name: Package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $bin = "target/${{ matrix.target }}/release/chat-cli.exe"
+          Compress-Archive -Path $bin -DestinationPath "chat-cli-${{ github.ref_name }}-${{ matrix.suffix }}.zip"
+          $hash = (Get-FileHash "chat-cli-${{ github.ref_name }}-${{ matrix.suffix }}.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  chat-cli-${{ github.ref_name }}-${{ matrix.suffix }}.zip" | Out-File "chat-cli-${{ github.ref_name }}-${{ matrix.suffix }}.zip.sha256" -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chat-cli-${{ matrix.suffix }}
+          path: |
+            chat-cli-${{ github.ref_name }}-${{ matrix.suffix }}.*
+  release:
+    name: Attach to GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

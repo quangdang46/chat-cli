@@ -124,6 +124,25 @@ chat-cli -v --config /tmp/my.toml -p "debug this"
 
 ## Installation
 
+### One-liner (recommended)
+
+```bash
+# macOS / Linux
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/chat-cli/main/install.sh?$(date +%s)" | bash
+```
+
+```powershell
+# Windows PowerShell
+irm "https://raw.githubusercontent.com/quangdang46/chat-cli/main/install.ps1" | iex
+```
+
+Installer flags: `--easy-mode` (auto PATH), `--verify`, `--from-source`,
+`--dest <dir>`, `--version vX.Y.Z`, `--uninstall`. Prebuilt binaries for
+linux-x86_64, linux-aarch64, macos-x86_64, macos-aarch64, windows-x86_64
+are attached to every GitHub Release with sha256 sidecars.
+
+### From source
+
 | Method | Command |
 |---|---|
 | From source (recommended) | `cargo build --release -p chat-cli && cp target/release/chat-cli ~/.local/bin/` |
@@ -133,8 +152,6 @@ chat-cli -v --config /tmp/my.toml -p "debug this"
 Requirements: Rust stable, `~/.local/bin` on `PATH` if you use `cargo install`.
 
 ---
-
-## Configuration
 
 Config lives at `~/.config/chat-cli/config.toml` (`0600`, atomic write). Override per invocation with `--config <path>`.
 
