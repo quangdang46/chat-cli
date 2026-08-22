@@ -181,13 +181,31 @@ chat-cli --config /tmp/ci.toml -p "use ephemeral config"
 ### `chat-cli auth`
 
 ```bash
-chat-cli auth login chatgpt                 # interactive, hidden input
+chat-cli auth login chatgpt                 # interactive — prints a DevTools console snippet first
 chat-cli auth login deepseek --token "..."  # non-interactive (for agents)
+chat-cli auth login chatgpt --token "..." --default   # also set as default_provider
+chat-cli auth default deepseek              # switch default_provider anytime
 chat-cli auth status                        # logged-in providers + expiry
 chat-cli auth logout chatgpt
 ```
 
-Validation on `login`: the CLI immediately calls `GET /api/auth/session` (ChatGPT) or the DeepSeek equivalent and reports success/failure — a bad paste is caught before it becomes a silent failure later.
+**Fast token capture** — `auth login` prints a ready-made console one-liner before
+prompting. Paste it into the provider site's DevTools console and the token lands
+in your clipboard, no panel-hunting:
+
+```js
+// chatgpt.com → DevTools Console:
+copy(document.cookie.split('; ').find(c => c.startsWith('__Secure-next-auth.session-token=')).split('=')[1])
+
+// chat.deepseek.com → DevTools Console:
+copy(JSON.parse(localStorage.getItem('userToken')).value)
+```
+
+Validation on `login`: the CLI immediately validates against the live endpoint
+(`GET /api/auth/session` for ChatGPT, session probe for DeepSeek) and reports
+success/failure — a bad paste is caught before it becomes a silent failure later.
+`default_provider` semantics: first login sets it; later logins keep it unless you
+pass `--default` or run `chat-cli auth default <provider>`.
 
 ### `chat-cli` (chat)
 

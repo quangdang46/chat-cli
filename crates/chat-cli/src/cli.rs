@@ -77,7 +77,12 @@ pub enum AuthCmd {
         provider: String,
         #[arg(long)]
         token: Option<String>,
+        /// Set this provider as default_provider (overrides first-login-only)
+        #[arg(long = "default")]
+        set_default: bool,
     },
+    /// Set a provider as default_provider
+    Default { provider: String },
     /// Show auth status
     Status,
     /// Logout from a provider

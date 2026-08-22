@@ -28,7 +28,26 @@ async fn run_subcommand(cmd: Command, global: &Args) -> anyhow::Result<()> {
     let config_path = global.config.as_deref().map(Path::new);
     match cmd {
         Command::Auth { cmd } => match cmd {
-            AuthCmd::Login { provider, token } => auth_login(&provider, token, config_path).await,
+            AuthCmd::Login {
+                provider,
+                token,
+                set_default,
+            } => auth_login(&provider, token, set_default, config_path).await,
+            AuthCmd::Default { provider } => {
+                let p = chat_core::provider::get_provider(&provider).is_some();
+                if !p {
+                    anyhow::bail!(
+                        "unknown provider '{}'. Registered: {:?}",
+                        provider,
+                        chat_core::provider::list_providers()
+                    );
+                }
+                let mut cfg = Config::load(config_path)?;
+                cfg.default_provider = Some(provider.clone());
+                cfg.save(config_path)?;
+                println!("default_provider = {provider}");
+                Ok(())
+            }
             AuthCmd::Status => {
                 let cfg = Config::load(config_path)?;
                 println!("default_provider: {:?}", cfg.default_provider);
@@ -111,11 +130,13 @@ async fn run_subcommand(cmd: Command, global: &Args) -> anyhow::Result<()> {
     }
 }
 
-/// `auth login <provider> [--token ...]`: validate via the provider, then
-/// persist with first-login-only default_provider semantics.
+/// `auth login <provider> [--token ...] [--default]`: print copy-paste
+/// snippets, validate via the provider, persist; `--default` overrides the
+/// first-login-only default_provider semantics.
 async fn auth_login(
     provider_id: &str,
     token: Option<String>,
+    set_default: bool,
     config_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let provider = chat_core::provider::get_provider(provider_id).ok_or_else(|| {
@@ -126,10 +147,13 @@ async fn auth_login(
         )
     })?;
 
+    // Copy-paste snippets BEFORE asking for the token: paste into DevTools
+    // console on the provider site and the token prints/copies in seconds.
+    print_token_snippets(provider_id);
+
     let token = match token {
         Some(t) => t,
         None => {
-            // Interactive hidden input (bead chat-cli-v2y polishes this path).
             eprint!("Paste session token for {provider_id}: ");
             use std::io::Write;
             std::io::stderr().flush()?;
@@ -160,12 +184,41 @@ DevTools → Application → Cookies"
         entry.session_token = Some(token.clone());
         entry.access_token_expiry = session.expiry.clone();
     }
-    cfg.ensure_default_provider(provider_id);
+    if set_default {
+        cfg.default_provider = Some(provider_id.to_string());
+    } else {
+        cfg.ensure_default_provider(provider_id);
+    }
     cfg.save(config_path)?;
 
     println!("logged in to {provider_id}");
+    if set_default {
+        println!("default_provider = {provider_id}");
+    }
     Ok(())
 }
+
+/// Console one-liners per provider: paste into the site's DevTools console
+/// to print (and copy) the session token without hunting through panels.
+fn print_token_snippets(provider_id: &str) {
+    let snippet = match provider_id {
+        "chatgpt" => concat!(
+            "// 1. Open https://chatgpt.com (logged in)\n",
+            "// 2. DevTools (F12) → Console → paste:\n",
+            "copy(document.cookie.split('; ').find(c => c.startsWith('__Secure-next-auth.session-token=')).split('=')[1])\n",
+            "// Token is now in your clipboard — paste it here."
+        ),
+        "deepseek" => concat!(
+            "// 1. Open https://chat.deepseek.com (logged in)\n",
+            "// 2. DevTools (F12) → Console → paste:\n",
+            "copy(JSON.parse(localStorage.getItem('userToken')).value)\n",
+            "// Token is now in your clipboard — paste it here."
+        ),
+        _ => return,
+    };
+    eprintln!("\n--- How to get your {provider_id} token ---\n{snippet}\n-----------------------------------------\n");
+}
+
 async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
     let config_path = args.config.as_deref().map(Path::new);
     let verbose = args.verbose;
@@ -559,13 +612,36 @@ mod tests {
     #[tokio::test]
     async fn auth_login_rejects_invalid_token_without_save() {
         test_calls();
+        ensure_failing_registered();
         let _env = temp_env();
-        // unknown provider cannot validate → hard error, nothing saved
+        let args = parse(&["auth", "login", "failingprov", "--token", "x"]);
+        run(args).await.unwrap_err();
+        assert!(
+            !Config::load(None)
+                .unwrap()
+                .providers
+                .contains_key("failingprov"),
+            "rejected token must not be saved"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_unknown_provider_is_clean_error() {
+        test_calls();
+        let _env = temp_env();
         let args = parse(&["auth", "login", "no-such-provider", "--token", "x"]);
         let err = run(args).await.unwrap_err();
         assert!(err
             .to_string()
             .contains("unknown provider 'no-such-provider'"));
+    }
+
+    #[tokio::test]
+    async fn snippets_printed_for_known_providers_only() {
+        // no panic; function is stderr-only
+        print_token_snippets("chatgpt");
+        print_token_snippets("deepseek");
+        print_token_snippets("unknownprov"); // silent
     }
 
     #[tokio::test]
