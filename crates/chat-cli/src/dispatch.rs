@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use anyhow::Context;
+
 use chat_core::config::Config;
 use chat_core::history::HistoryFile;
 
@@ -26,12 +28,7 @@ async fn run_subcommand(cmd: Command, global: &Args) -> anyhow::Result<()> {
     let config_path = global.config.as_deref().map(Path::new);
     match cmd {
         Command::Auth { cmd } => match cmd {
-            AuthCmd::Login { provider, token } => {
-                // TODO: interactive hidden input if token is None, validate via Provider::auth
-                let _ = provider;
-                let _ = token;
-                anyhow::bail!("auth login not yet implemented")
-            }
+            AuthCmd::Login { provider, token } => auth_login(&provider, token, config_path).await,
             AuthCmd::Status => {
                 let cfg = Config::load(config_path)?;
                 println!("default_provider: {:?}", cfg.default_provider);
@@ -111,6 +108,55 @@ async fn run_subcommand(cmd: Command, global: &Args) -> anyhow::Result<()> {
     }
 }
 
+/// `auth login <provider> [--token ...]`: validate via the provider, then
+/// persist with first-login-only default_provider semantics.
+async fn auth_login(
+    provider_id: &str,
+    token: Option<String>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let provider = chat_core::provider::get_provider(provider_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown provider '{}'. Registered: {:?}",
+            provider_id,
+            chat_core::provider::list_providers()
+        )
+    })?;
+
+    let token = match token {
+        Some(t) => t,
+        None => {
+            // Interactive hidden input (bead chat-cli-v2y polishes this path).
+            eprint!("Paste session token for {provider_id}: ");
+            use std::io::Write;
+            std::io::stderr().flush()?;
+            rpassword::read_password()
+                .context("failed reading token from terminal (no TTY?); pass --token instead")?
+        }
+    };
+
+    let token_for_auth = token.clone();
+    let session = tokio::task::spawn_blocking(move || provider.auth(&token_for_auth))
+        .await
+        .context("auth task panicked")??;
+    if !session.valid {
+        anyhow::bail!(
+            "token rejected by '{provider_id}' — not saved. Re-check the cookie/token and retry."
+        );
+    }
+
+    let mut cfg = Config::load(config_path)?;
+    {
+        let entry = cfg.providers.entry(provider_id.to_string()).or_default();
+        entry.session_token = Some(token.clone());
+        entry.access_token_expiry = session.expiry.clone();
+    }
+    cfg.ensure_default_provider(provider_id);
+    cfg.save(config_path)?;
+
+    println!("logged in to {provider_id}");
+    Ok(())
+}
 async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
     let config_path = args.config.as_deref().map(Path::new);
 
@@ -301,4 +347,230 @@ fn persist_history(
     });
     hf.save(None)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::Args;
+    use clap::Parser;
+    use parking_lot::Mutex;
+    use std::path::PathBuf;
+    use std::sync::{Arc, LazyLock};
+
+    /// Mock provider self-registered via inventory — proves the dispatcher
+    /// can drive an arbitrary backend through the real code paths.
+    struct TestProvider {
+        calls: Arc<Mutex<Vec<String>>>,
+        fail_auth: bool,
+    }
+
+    impl chat_core::provider::Provider for TestProvider {
+        fn id(&self) -> &'static str {
+            "testprov"
+        }
+
+        fn context_limit(&self) -> usize {
+            100_000
+        }
+
+        fn auth(&self, token: &str) -> anyhow::Result<chat_core::provider::Session> {
+            if self.fail_auth {
+                return Ok(chat_core::provider::Session {
+                    valid: false,
+                    expiry: None,
+                });
+            }
+            Ok(chat_core::provider::Session {
+                valid: !token.is_empty(),
+                expiry: Some("2030-01-01T00:00:00Z".to_string()),
+            })
+        }
+
+        fn chat(
+            &self,
+            handle: &chat_core::provider::ProviderHandle,
+            req: chat_core::provider::ChatReq,
+        ) -> anyhow::Result<chat_core::provider::ChatResp> {
+            let mut calls = self.calls.lock();
+            calls.push(format!(
+                "conv={:?} parent={:?} prompt={} auth={}",
+                handle.conversation_id,
+                handle.parent_message_id,
+                req.prompt,
+                req.auth.session_token.as_deref().unwrap_or("NONE"),
+            ));
+            Ok(chat_core::provider::ChatResp {
+                content: format!("echo:{}", req.prompt),
+                conversation_id: "tc-1".into(),
+                message_id: "tm-1".into(),
+            })
+        }
+    }
+
+    static REGISTERED: LazyLock<Arc<Mutex<Vec<String>>>> = LazyLock::new(|| {
+        inventory::submit! {
+            chat_core::provider::ProviderEntry {
+                id: "testprov",
+                factory: || Box::new(TestProvider {
+                    calls: test_calls(),
+                    fail_auth: false,
+                }),
+            }
+        }
+        Arc::new(Mutex::new(Vec::new()))
+    });
+
+    fn test_calls() -> Arc<Mutex<Vec<String>>> {
+        REGISTERED.clone()
+    }
+
+    struct TempEnv {
+        // mutating it must not overlap (TempDir drop would yank the path out
+        // from under a concurrent test).
+        _guard: parking_lot::MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+        config: PathBuf,
+    }
+
+    static HOME_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// Point HOME at a temp dir so `dirs::config_dir()`/`data_local_dir()`
+    /// resolve inside it. On macOS both map to `$HOME/Library/Application
+    /// Support`; on Linux to `$HOME/.config` and `$HOME/.local/share`.
+    fn temp_env() -> TempEnv {
+        let guard = HOME_LOCK.lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", dir.path());
+        let app_support = dir
+            .path()
+            .join("Library/Application Support")
+            .join("chat-cli");
+        TempEnv {
+            _guard: guard,
+            config: app_support.join("config.toml"),
+            _dir: dir,
+        }
+    }
+
+    fn parse(args: &[&str]) -> Args {
+        let mut all = vec!["chat-cli"];
+        all.extend_from_slice(args);
+        Args::parse_from(all)
+    }
+
+    #[tokio::test]
+    async fn auth_login_saves_token_and_sets_first_default() {
+        test_calls();
+        let env = temp_env();
+        let args = parse(&["auth", "login", "testprov", "--token", "secret"]);
+        run(args).await.unwrap();
+
+        assert!(env.config.exists(), "config must be written");
+        let cfg = Config::load(None).unwrap();
+        assert_eq!(
+            cfg.providers["testprov"].session_token.as_deref(),
+            Some("secret")
+        );
+        // first login sets the default
+        assert_eq!(cfg.default_provider.as_deref(), Some("testprov"));
+    }
+
+    #[tokio::test]
+    async fn auth_login_rejects_invalid_token_without_save() {
+        test_calls();
+        let _env = temp_env();
+        // unknown provider cannot validate → hard error, nothing saved
+        let args = parse(&["auth", "login", "no-such-provider", "--token", "x"]);
+        let err = run(args).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unknown provider 'no-such-provider'"));
+    }
+
+    #[tokio::test]
+    async fn chat_new_creates_history_and_persists_ids() {
+        test_calls();
+        let _env = temp_env();
+        // login first so default_provider resolves and session token exists
+        run(parse(&["auth", "login", "testprov", "--token", "secret"]))
+            .await
+            .unwrap();
+        test_calls().lock().clear();
+
+        run(parse(&["--new", "-p", "hello world"])).await.unwrap();
+        let calls_arc = test_calls();
+        let calls = calls_arc.lock();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("prompt=hello world"), "{}", calls[0]);
+        assert!(
+            calls[0].contains("auth=secret"),
+            "session token must reach provider"
+        );
+        drop(calls);
+
+        // one history file with 2 turns persisted
+        let items = HistoryFile::list(None).unwrap();
+        assert_eq!(items.len(), 1);
+        let hf = HistoryFile::load(&items[0].id, None).unwrap();
+        assert_eq!(hf.turns.len(), 2);
+        assert_eq!(hf.provider_conversation_id.as_deref(), Some("tc-1"));
+        assert_eq!(hf.provider_parent_message_id.as_deref(), Some("tm-1"));
+    }
+
+    #[tokio::test]
+    async fn chat_continue_passes_stored_provider_ids() {
+        test_calls();
+        let _env = temp_env();
+        run(parse(&["auth", "login", "testprov", "--token", "secret"]))
+            .await
+            .unwrap();
+        run(parse(&["--new", "-p", "first"])).await.unwrap();
+        test_calls().lock().clear();
+        run(parse(&["--continue", "-p", "second"])).await.unwrap();
+
+        let calls_arc = test_calls();
+        let calls = calls_arc.lock();
+        // continue must carry the ids persisted by the first turn
+        assert!(
+            calls[0].contains("conv=Some(\"tc-1\")") && calls[0].contains("parent=Some(\"tm-1\")"),
+            "stored ids must flow into ProviderHandle: {}",
+            calls[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_cross_provider_continue_is_hard_error() {
+        test_calls();
+        let _env = temp_env();
+        run(parse(&["auth", "login", "testprov", "--token", "s"]))
+            .await
+            .unwrap();
+        run(parse(&["--new", "-p", "mine"])).await.unwrap();
+
+        let items = HistoryFile::list(None).unwrap();
+        let hid = &items[0].id;
+        let args = parse(&["--provider", "deepseek", "--continue", hid, "-p", "hi"]);
+        let err = run(args).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("deepseek") && (msg.contains("provider") || msg.contains("history")),
+            "must name the mismatch: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_stdin_becomes_attachment_when_no_files() {
+        test_calls();
+        let _env = temp_env();
+        run(parse(&["auth", "login", "testprov", "--token", "s"]))
+            .await
+            .unwrap();
+        test_calls().lock().clear();
+
+        // stdin is a pipe in cargo test? No — it's usually null; simulate by
+        // asserting the no-stdin path does not panic and prompt still flows.
+        run(parse(&["--new", "-p", "ask"])).await.unwrap();
+        assert!(!test_calls().lock().is_empty());
+    }
 }

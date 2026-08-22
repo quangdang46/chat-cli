@@ -44,11 +44,11 @@ pub struct Args {
     pub attach: Vec<String>,
 
     /// Force new conversation
-    #[arg(long, conflicts_with = "continue_id")]
+    #[arg(long = "new", conflicts_with = "continue_id")]
     pub new: bool,
 
     /// Continue conversation (optionally by id)
-    #[arg(long, value_name = "ID", num_args = 0..=1, default_missing_value = "")]
+    #[arg(long = "continue", value_name = "ID", num_args = 0..=1, default_missing_value = "")]
     pub continue_id: Option<String>,
 }
 

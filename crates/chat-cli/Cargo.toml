@@ -19,3 +19,8 @@ tokio.workspace = true
 inventory.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
+rpassword.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+parking_lot.workspace = true
