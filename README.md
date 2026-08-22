@@ -114,7 +114,7 @@ chat-cli -v --config /tmp/my.toml -p "debug this"
 | Budget fails loud, never silently truncates | `crates/chat-core/src/budget.rs` checks `system + history + attachments + prompt` against `context_limit()` and prints a per-segment breakdown so the agent can decide what to cut. |
 | History is local and honest | `crates/chat-core/src/history.rs` is append-only `~/.local/share/chat-cli/history/<id>.jsonl` with `provider_conversation_id` + `provider_parent_message_id` stored explicitly. Cross-provider `--continue` is rejected with a clear error. |
 | Auth is paste-once, then rolling | `crates/chat-core/src/config.rs` stores `~/.config/chat-cli/config.toml` (`0600`, atomic `write+rename`) with `default_provider` as source of truth. First login sets the default; later logins don't override it. |
-| Browser fidelity without a browser | `crates/provider-chatgpt/src/{pow,protocol}.rs` solves the sentinel PoW and does a rolling `GET /api/auth/session` refresh — same endpoints the browser hits, no headed browser required. |
+| Browser fidelity without a browser | `crates/provider-chatgpt` does a rolling `GET /api/auth/session` refresh, asks `/backend-api/sentinel/chat-requirements`, and posts `/backend-api/conversation` with SSE parsing — same endpoints the browser hits, no headed browser required. The DeepSeekHashV1 PoW solver lives in `crates/deepseek-pow`, shared by both providers. |
 
 ---
 
@@ -219,8 +219,12 @@ chat-core (crates/chat-core)        ← knows no concrete provider
        │
 provider-chatgpt (crates/provider-chatgpt)    provider-deepseek (crates/provider-deepseek)
   protocol.rs   — /api/auth/session, sentinel,   protocol.rs  — chat.deepseek.com/api/v0/*
-                 /backend-api/conversation
-  pow.rs        — Keccak-f[1600] rounds 1..23
+                 chat-requirements, conversation
+  lib.rs        — rolling session refresh,        lib.rs       — fetch_page probe, session create,
+                 conversation POST + SSE parse                PoW, completion stream parse
+       │
+deepseek-pow (crates/deepseek-pow) — Keccak-f[1600] rounds 1..23 solver
+  shared by both providers (DeepSeekHashV1 challenge format)
 ```
 
 Add a new backend without touching core:
@@ -240,6 +244,9 @@ cargo new crates/provider-gemini --lib
 | `No provider specified and no default_provider set` | No `--provider` flag and no `default_provider` in config | `chat-cli auth login chatgpt` (first login sets default) or `chat-cli config set default_provider chatgpt` |
 | `history 'abc' was created with provider 'chatgpt', cannot continue with '--provider deepseek'` | Cross-provider `--continue` | Use `--new` or `--continue` with a history from the same provider; `history list --provider deepseek` to find the right id |
 | `glob pattern '...' matched no files` | No file matched the `-a` glob | Check the pattern from the repo root, or use `-a @filelist.txt` |
+| `chatgpt requested a proof-of-work this build cannot solve yet` | ChatGPT demanded a sentinel PoW variant beyond the shared DeepSeekHashV1 solver | Retry (most turns don't require it), or fall back to `--provider deepseek` |
+| `429 rate-limited by chatgpt/deepseek` | Provider rate limit hit | Wait and retry, or switch providers with `--provider` |
+| `no assistant response found in conversation stream` / `no content found in deepseek completion stream` | Model refused, account flagged, or session expired mid-chat | Re-run `auth login`, try `--new`, or check the provider's web app |
 | `file '...' too large` / `total attachments too large` | Per-file 1 MB / total 5 MB guard | Split the file or pass fewer attachments |
 | `context limit ... exceeded: system=... history=... attachments=... prompt=...` | Combined input exceeds provider limit | Drop attachments, use `--new`, or shorten history; the breakdown tells you which segment to cut |
 | `auth login` reports invalid | Pasted token is wrong or the browser cookie name is different | ChatGPT: copy `__Secure-next-auth.session-token` exactly (DevTools → Application → Cookies); DeepSeek: copy the session token, then re-run with `--token` |
@@ -278,7 +285,7 @@ Create `crates/provider-gemini`, implement `Provider { id, context_limit, auth, 
 
 ```bash
 cargo build                          # all crates
-cargo test -p chat-core              # core unit tests
+cargo test --workspace               # core + providers + cli (offline, mocked)
 cargo run -p chat-cli -- --help      # inspect the surface
 ```
 

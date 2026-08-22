@@ -2,7 +2,7 @@
 
 > **Goal:** a single `chat-cli -p "..." -a ./PLAN.md --provider chatgpt` that an agent can call headlessly, while the human pastes a web session token once and never touches the browser again.
 >
-> **Status:** scaffold done (`cargo check` clean), POC plan below is the build order.
+> **Status:** POC implemented — all 4 phases landed (chat-core, both providers, CLI wiring + polish). See README.md for the user-facing surface; this plan is the build-order record.
 
 ---
 
@@ -218,7 +218,7 @@ pub fn budget_check(system: Option<&str>, history_text: &str,
 
 Checked at the **last point** before `Provider::chat()` — so the breakdown is truthful. No silent truncation; the agent decides what to cut.
 
-### 5.6 PoW (`provider-chatgpt/src/pow.rs`)
+### 5.6 PoW (`crates/deepseek-pow` — moved out of `provider-chatgpt` during implementation)
 
 Keccak-f[1600] **rounds 1..23** (skip round 0) — same variant as DeepSeek's `DeepSeekHashV1`. API:
 
