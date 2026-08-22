@@ -320,6 +320,33 @@ pub fn solve_and_build_header(challenge: &Challenge) -> anyhow::Result<String> {
     build_pow_header(challenge, answer)
 }
 
+/// Value for the `p` field of `POST /backend-api/sentinel/chat-requirements`.
+///
+/// The browser sends a base64 proof blob of
+/// `[screen-correlator, timestamp_ms, sentinel-config-hash, 0, 1, user-agent]`
+/// where the config hash comes from the page's `/sentinel/config.js`. The POC
+/// ships a stable correlator + live timestamp — enough for the server to
+/// hand out a requirements token in the common (non-Turnstile) case; when the
+/// server answers with `proofofwork.required = true`, `solve_and_build_header`
+/// covers the DeepSeekHashV1-style follow-up shared with DeepSeek.
+pub fn chat_requirements_proof() -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let payload = serde_json::json!([
+        "en-US",
+        now_ms,
+        "https://chatgpt.com/backend-api/sentinel/chat-requirements",
+        0,
+        1,
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ])
+    .to_string();
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
