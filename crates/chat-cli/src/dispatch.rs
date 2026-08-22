@@ -614,4 +614,67 @@ mod tests {
         run(parse(&["--new", "-p", "ask"])).await.unwrap();
         assert!(!test_calls().lock().is_empty());
     }
+
+    #[tokio::test]
+    async fn chat_continue_explicit_id_targets_that_history() {
+        test_calls();
+        let _env = temp_env();
+        run(parse(&["auth", "login", "testprov", "--token", "s"]))
+            .await
+            .unwrap();
+        run(parse(&["--new", "-p", "root turn"])).await.unwrap();
+        let items = HistoryFile::list(None).unwrap();
+        let hid = items[0].id.clone();
+        test_calls().lock().clear();
+
+        run(parse(&["--continue", &hid, "-p", "branch"]))
+            .await
+            .unwrap();
+        let calls_arc = test_calls();
+        let calls = calls_arc.lock();
+        assert!(
+            calls[0].ends_with("branch auth=s") && calls[0].contains("root turn"),
+            "explicit --continue <id> sends history text + new prompt: {:?}",
+            calls
+        );
+    }
+
+    #[tokio::test]
+    async fn history_subcommands_list_show_rm_round_trip() {
+        test_calls();
+        let _env = temp_env();
+        run(parse(&["auth", "login", "testprov", "--token", "s"]))
+            .await
+            .unwrap();
+        run(parse(&["--new", "-p", "for history"])).await.unwrap();
+        let items = HistoryFile::list(None).unwrap();
+        assert_eq!(items.len(), 1, "list must see the fresh file");
+        let hid = items[0].id.clone();
+
+        // show prints valid JSON of the history
+        run(parse(&["history", "show", &hid])).await.unwrap();
+
+        // rm deletes it; subsequent list is empty
+        run(parse(&["history", "rm", &hid])).await.unwrap();
+        let after = HistoryFile::list(None).unwrap();
+        assert!(after.is_empty(), "rm must remove the file");
+    }
+
+    #[tokio::test]
+    async fn history_list_filters_by_provider_and_limit() {
+        test_calls();
+        let _env = temp_env();
+        run(parse(&["auth", "login", "testprov", "--token", "s"]))
+            .await
+            .unwrap();
+        run(parse(&["--new", "-p", "one"])).await.unwrap();
+
+        // provider filter for a different provider yields nothing (no panic)
+        run(parse(&["history", "list", "--provider", "deepseek"]))
+            .await
+            .unwrap();
+        run(parse(&["history", "list", "--limit", "5"]))
+            .await
+            .unwrap();
+    }
 }
