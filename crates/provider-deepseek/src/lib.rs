@@ -1,7 +1,7 @@
 //! DeepSeek web provider — session validation, PoW, chat completion.
 //!
 //! Flow (mirrors the ds2api reference client):
-//! 1. `auth(token)` probes `POST /chat_session/fetch_page` with
+//! 1. `auth(token)` probes `GET /chat_session/fetch_page` with
 //!    `authorization: Bearer <token>` — success proves the token works.
 //! 2. `chat()`: `--new` first creates a session via `POST /chat_session/create`;
 //!    then (if challenged) solves PoW via `/chat/create_pow_challenge` and
@@ -64,18 +64,19 @@ impl DeepSeekProvider {
     }
 
     /// Probe an authenticated endpoint; cheap proof that the token works.
+    /// `fetch_page` is a GET with query params (ds2api client_session.go:196),
+    /// not a POST.
     fn probe_token(probe_url: &str, token: &str) -> anyhow::Result<bool> {
         let client = Self::http_client().context("failed to build HTTP client")?;
-        // fetch_page with empty body returns the caller's sessions when authed.
         let resp = Self::request(
             &client,
-            reqwest::Method::POST,
-            probe_url,
+            reqwest::Method::GET,
+            &format!("{probe_url}?lte_cursor.pinned=false"),
             Some(token),
-            Some(serde_json::json!({"offset": 0, "limit": 1})),
+            None,
         )
         .send()
-        .with_context(|| format!("POST {probe_url} failed — check network/proxy"))?;
+        .with_context(|| format!("GET {probe_url} failed — check network/proxy"))?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -312,9 +313,16 @@ impl Provider for DeepSeekProvider {
                 "no deepseek session_token in config — run 'chat-cli auth login deepseek' first"
             )
         })?;
+        // Attachments arrive as `<<<FILE: path>>>` fenced text — inline them
+        // ahead of the prompt, same convention as the ChatGPT provider.
+        let prompt = if req.attachments_text.is_empty() {
+            req.prompt
+        } else {
+            format!("{}\n\n{}", req.attachments_text, req.prompt)
+        };
         Self::chat_at(
             handle,
-            req.prompt,
+            prompt,
             protocol::CREATE_SESSION_URL,
             protocol::CREATE_POW_URL,
             protocol::COMPLETION_URL,
@@ -412,11 +420,14 @@ mod tests {
     #[test]
     fn auth_valid_token_probes_fetch_page() {
         let mut s = server();
-        s.mock("POST", "/api/v0/chat_session/fetch_page")
-            .match_header("authorization", "Bearer good-token")
-            .with_status(200)
-            .with_body(r#"{"data":{"biz_data":{"chat_sessions":[]}}}"#)
-            .create();
+        s.mock(
+            "GET",
+            mockito::Matcher::Regex(r"^/api/v0/chat_session/fetch_page\?.*".to_string()),
+        )
+        .match_header("authorization", "Bearer good-token")
+        .with_status(200)
+        .with_body(r#"{"data":{"biz_data":{"chat_sessions":[]}}}"#)
+        .create();
         let url = s.url();
 
         let session = DeepSeekProvider
@@ -428,9 +439,12 @@ mod tests {
     #[test]
     fn auth_rejected_token_maps_401_to_invalid() {
         let mut s = server();
-        s.mock("POST", "/api/v0/chat_session/fetch_page")
-            .with_status(401)
-            .create();
+        s.mock(
+            "GET",
+            mockito::Matcher::Regex(r"^/api/v0/chat_session/fetch_page\?.*".to_string()),
+        )
+        .with_status(401)
+        .create();
         let url = s.url();
 
         let ok = DeepSeekProvider
