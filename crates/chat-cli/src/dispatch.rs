@@ -148,10 +148,32 @@ async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
     )?;
 
     // 5. Build ChatReq and call provider
+    let pcfg = cfg.providers.get(&provider_id).cloned().unwrap_or_default();
+    let config_for_persist = config_path.map(|p| p.to_path_buf());
+    let provider_id_for_persist = provider_id.clone();
+    let auth = chat_core::provider::AuthContext {
+        session_token: pcfg.session_token,
+        access_token: pcfg.access_token,
+        access_token_expiry: pcfg.access_token_expiry,
+        persist: Some(std::sync::Arc::new(
+            move |token: &str, expiry: &str| -> anyhow::Result<()> {
+                let mut cfg = Config::load(config_for_persist.as_deref())?;
+                let entry = cfg
+                    .providers
+                    .entry(provider_id_for_persist.clone())
+                    .or_default();
+                entry.access_token = Some(token.to_string());
+                entry.access_token_expiry = Some(expiry.to_string());
+                cfg.save(config_for_persist.as_deref())
+            },
+        )),
+    };
+
     let req = chat_core::provider::ChatReq {
         prompt: prompt.clone(),
         system: args.system.clone(),
         attachments_text,
+        auth,
     };
 
     // Combine history_text + req into final prompt if continuing
@@ -162,6 +184,7 @@ async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
             prompt: format!("{}{}", history_text, prompt),
             system: args.system.clone(),
             attachments_text: req.attachments_text,
+            auth: req.auth,
         }
     };
 

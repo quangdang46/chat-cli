@@ -19,7 +19,8 @@ anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.38", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
+parking_lot = "0.12"
 clap = { version = "4.5", features = ["derive"] }
 toml = "0.8"
 dirs = "5.0"

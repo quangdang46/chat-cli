@@ -18,3 +18,7 @@ inventory.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+parking_lot.workspace = true
+mockito = "1"

@@ -18,8 +18,7 @@ pub struct ProviderHandle {
     pub parent_message_id: Option<String>,
 }
 
-/// Input to a chat turn.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChatReq {
     /// The user prompt for this turn.
     pub prompt: String,
@@ -27,6 +26,63 @@ pub struct ChatReq {
     pub system: Option<String>,
     /// Already-prepared attachments text (via `prepare_attachments`).
     pub attachments_text: String,
+    /// Authenticated session material + persistence target for rolling refresh.
+    /// Populated by the dispatcher from `config.toml`; providers that need
+    /// tokens (all web providers) read it here and may write refreshed values
+    /// back through `persist` before returning.
+    pub auth: AuthContext,
+}
+
+/// Everything a web provider needs to authenticate one chat turn, plus where
+/// to persist a rolled access_token. `session_token` is the long-lived paste;
+/// `access_token`/`access_token_expiry` are the rolling cache.
+#[derive(Clone, Default)]
+pub struct AuthContext {
+    pub session_token: Option<String>,
+    pub access_token: Option<String>,
+    /// RFC 3339 timestamp after which `access_token` must be refreshed.
+    pub access_token_expiry: Option<String>,
+    /// Called by providers after refreshing credentials so the new
+    /// access_token/expiry survive the process. No-op closure when there is
+    /// nothing to persist (e.g. tests).
+    #[allow(clippy::type_complexity)]
+    pub persist: Option<std::sync::Arc<dyn Fn(&str, &str) -> anyhow::Result<()> + Send + Sync>>,
+}
+
+impl std::fmt::Debug for AuthContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthContext")
+            .field("session_token", &self.session_token.as_ref().map(|_| "…"))
+            .field("access_token", &self.access_token.as_ref().map(|_| "…"))
+            .field("access_token_expiry", &self.access_token_expiry)
+            .field("persist", &self.persist.is_some())
+            .finish()
+    }
+}
+
+impl AuthContext {
+    /// Persist a refreshed access token + expiry via the dispatcher-provided
+    /// callback. Errors are returned; callers decide whether they are fatal.
+    pub fn persist_access_token(&self, token: &str, expiry: &str) -> anyhow::Result<()> {
+        match &self.persist {
+            Some(save) => save(token, expiry),
+            None => Ok(()),
+        }
+    }
+
+    fn expiry_passed(&self) -> bool {
+        match (&self.access_token_expiry, self.access_token.is_some()) {
+            (Some(exp), true) => chrono::DateTime::parse_from_rfc3339(exp)
+                .map(|t| t < chrono::Utc::now())
+                .unwrap_or(true),
+            _ => true,
+        }
+    }
+
+    /// True when the cached access_token exists and its expiry has not passed.
+    pub fn has_fresh_access_token(&self) -> bool {
+        self.access_token.is_some() && !self.expiry_passed()
+    }
 }
 
 /// Output from a chat turn, including new IDs to persist in history.
@@ -168,9 +224,11 @@ mod tests {
                     prompt: "hi".to_string(),
                     system: None,
                     attachments_text: String::new(),
+                    auth: AuthContext::default(),
                 },
             )
             .unwrap();
+
         assert_eq!(resp.content, "echo: hi");
         assert_eq!(resp.conversation_id, "conv-mock");
         assert_eq!(resp.message_id, "msg-mock");
