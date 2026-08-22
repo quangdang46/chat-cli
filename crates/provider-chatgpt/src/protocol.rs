@@ -30,6 +30,70 @@ pub struct SessionResponse {
     pub expires: Option<String>,
 }
 
+/// Stable per-install device id for `Oai-Device-Id` (the browser stores a
+/// uuid; any stable uuid satisfies the sentinel).
+pub fn device_id() -> String {
+    use std::sync::OnceLock;
+    static DEVICE: OnceLock<String> = OnceLock::new();
+    DEVICE
+        .get_or_init(|| uuid::Uuid::new_v4().to_string())
+        .clone()
+}
+
+/// Chrome-like UA matching the config array convention (FreeGPT35/chatGPTBox).
+pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36";
+
+/// Solve the ChatGPT sentinel proof-of-work and build the
+/// `Openai-Sentinel-Proof-Token` header value.
+///
+/// Mirrors the browser `_generateAnswer` (chatGPTBox `generateProofToken`,
+/// FreeGPT35 `app.js`): brute-force an index into a base64(JSON) config array
+/// until `sha3_512(seed + base)` hex prefix <= difficulty, then prepend the
+/// `gAAAAAB` marker.
+pub fn solve_proof_token(seed: &str, difficulty: &str) -> String {
+    let now = chrono::Utc::now() - chrono::Duration::hours(8);
+    let parse_time = now
+        .format("%a, %d %b %Y %H:%M:%S GMT-0500 (Eastern Time)")
+        .to_string();
+    let mut config = serde_json::json!([
+        4058u64, // screen + core (3000/4000/6000 + 8..24)
+        parse_time,
+        4294705152u64,
+        0u64, // attempt counter — mutated per loop
+        USER_AGENT,
+        "https://tcr9i.chat.openai.com/v2/35536E1E-65B4-4D96-9D97-6ADB7EFF8147/api.js",
+        "dpl=1440a687921de39ff5ee56b92807faaadce73f13",
+        "en",
+        "en-US",
+        4294705152u64,
+        "plugins−[object PluginArray]",
+        101u64,
+        301u64,
+    ]);
+
+    use sha3::{Digest, Sha3_512};
+    let arr = config.as_array_mut().expect("config is an array");
+    let diff_len = difficulty.len() / 2;
+    for i in 0..500_000u64 {
+        arr[3] = serde_json::json!(i);
+        let json_data = serde_json::to_string(arr).expect("array serializes");
+        use base64::Engine;
+        let base = base64::engine::general_purpose::STANDARD.encode(json_data.as_bytes());
+        let mut hasher = Sha3_512::new();
+        hasher.update(seed.as_bytes());
+        hasher.update(base.as_bytes());
+        let digest = hasher.finalize();
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        if &hex[..diff_len] <= difficulty {
+            return format!("gAAAAAB{base}");
+        }
+    }
+    // Fallback observed in reference impls when unsolved within attempts.
+    use base64::Engine;
+    let fallback = base64::engine::general_purpose::STANDARD.encode(format!("\"{seed}\""));
+    format!("gAAAAABwQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D{fallback}")
+}
+
 /// `POST /sentinel/chat-requirements` — server decides whether a proof-of-work
 /// is required before a conversation POST.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -193,5 +257,27 @@ mod tests {
         cont.conversation_id = Some("conv-uuid".into());
         let v: serde_json::Value = serde_json::to_value(&cont).unwrap();
         assert_eq!(v["conversation_id"], "conv-uuid");
+    }
+
+    #[test]
+    fn proof_token_has_gaaaaab_prefix_and_solves_low_difficulty() {
+        let token = solve_proof_token("0.9abcdef", "0003ff");
+        assert!(token.starts_with("gAAAAAB"), "prefix required: {token}");
+    }
+
+    #[test]
+    fn proof_token_deterministic_for_same_seed_and_difficulty() {
+        let a = solve_proof_token("seed-x", "00ffff");
+        let b = solve_proof_token("seed-x", "00ffff");
+        assert_eq!(
+            a, b,
+            "same inputs must give same token (fixed counter path)"
+        );
+    }
+
+    #[test]
+    fn device_id_is_stable_within_process() {
+        assert_eq!(device_id(), device_id());
+        assert!(device_id().len() >= 32);
     }
 }

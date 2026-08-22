@@ -144,11 +144,15 @@ impl ChatGptProvider {
         conversation_url: &str,
     ) -> anyhow::Result<ChatResp> {
         let client = Self::http_client().context("failed to build HTTP client")?;
+        let device_id = protocol::device_id();
 
         // --- Sentinel: ask whether this turn needs a proof-of-work ---
         let requirements: crate::protocol::ChatRequirements = client
             .post(requirements_url)
             .header("Authorization", format!("Bearer {access_token}"))
+            .header("Oai-Device-Id", &device_id)
+            .header("Oai-Language", "en-US")
+            .header("User-Agent", protocol::USER_AGENT)
             .json(&serde_json::json!({"p": pow::chat_requirements_proof()}))
             .send()
             .with_context(|| format!("POST {requirements_url} failed"))?
@@ -175,11 +179,17 @@ impl ChatGptProvider {
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let user_message_id = Uuid::new_v4().to_string();
-        let full_prompt = if req.attachments_text.is_empty() {
-            req.prompt.clone()
-        } else {
-            format!("{}\n\n{}", req.attachments_text, req.prompt)
-        };
+        // The web payload has no separate system field; the browser injects
+        // platform instructions into the first user part. Same convention here.
+        let mut full_prompt = String::new();
+        if let Some(sys) = &req.system {
+            full_prompt.push_str(&format!("[System instruction]: {sys}\n\n"));
+        }
+        if !req.attachments_text.is_empty() {
+            full_prompt.push_str(&req.attachments_text);
+            full_prompt.push_str("\n\n");
+        }
+        full_prompt.push_str(&req.prompt);
 
         let payload = protocol::ConversationPayload {
             action: "next",
@@ -205,6 +215,9 @@ impl ChatGptProvider {
                 "OpenAI-Sentinel-Chat-Requirements-Token",
                 &openai_sentinel_token,
             )
+            .header("Oai-Device-Id", &device_id)
+            .header("Oai-Language", "en-US")
+            .header("User-Agent", protocol::USER_AGENT)
             .header("Accept", "text/event-stream")
             .json(&payload);
         if let Some(pow) = &requirements.proof_of_work {
@@ -243,15 +256,11 @@ impl ChatGptProvider {
         })
     }
 
-    /// ChatGPT's sentinel uses its own proof scheme; POC solves only when the
-    /// server marks it required, using difficulty encoded in the challenge.
+    /// ChatGPT sentinel proof-of-work: brute-force `sha3_512(seed + base64)`
+    /// until the hex prefix meets `difficulty`, wrapped in the `gAAAAAB`
+    /// marker (browser `_generateAnswer` scheme).
     fn solve_sentinel_pow(pow: &protocol::PowRequired) -> anyhow::Result<String> {
-        // The browser computes a gpt-proof-token; without the exact JS seed
-        // derivation we surface a clear error instead of a silent wrong answer.
-        let _ = (pow.seed.as_str(), pow.difficulty.as_str());
-        bail!(
-            "chatgpt requested a proof-of-work this build cannot solve yet — retry, or use '--provider deepseek'"
-        )
+        Ok(protocol::solve_proof_token(&pow.seed, &pow.difficulty))
     }
 
     /// Extract `(content, conversation_id, message_id)` from the SSE/JSONL
