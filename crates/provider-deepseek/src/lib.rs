@@ -95,7 +95,8 @@ impl DeepSeekProvider {
             reqwest::Method::POST,
             create_url,
             Some(token),
-            Some(serde_json::json!({})),
+            // ds2api sends {"agent": "chat"} (client_auth.go CreateSession)
+            Some(serde_json::json!({"agent": "chat"})),
         )
         .send()
         .with_context(|| format!("POST {create_url} failed"))?
@@ -107,6 +108,7 @@ impl DeepSeekProvider {
             .context("invalid JSON from chat_session/create")?;
         body["data"]["biz_data"]["id"]
             .as_str()
+            .or_else(|| body["data"]["biz_data"]["chat_session"]["id"].as_str())
             .or_else(|| body["data"]["id"].as_str())
             .map(String::from)
             .ok_or_else(|| {
@@ -143,24 +145,33 @@ impl DeepSeekProvider {
     }
 
     /// One completion POST; returns `(content, message_id)`.
+    ///
+    /// Payload mirrors ds2api's canonical builder
+    /// (`internal/promptcompat/standard_request.go CompletionPayload`):
+    /// `chat_session_id`, `model_type`, `parent_message_id` (null for fresh
+    /// turns, int for follow-ups), `prompt`, `ref_file_ids`,
+    /// `thinking_enabled`, `search_enabled`.
     fn post_completion(
         completion_url: &str,
         token: &str,
-        parent_id: Option<&str>,
+        parent_message_id: Option<&str>,
         chat_session_id: &str,
         prompt: String,
         pow_header: Option<String>,
     ) -> anyhow::Result<(String, String)> {
         let client = Self::http_client().context("failed to build HTTP client")?;
-        let mut payload = serde_json::json!({
+        let parent = parent_message_id
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|id| *id > 0);
+        let payload = serde_json::json!({
             "chat_session_id": chat_session_id,
-            "parent_id": parent_id.map(|s| s.parse::<i64>().unwrap_or(0)).unwrap_or(0),
-            "refs": [],
-            "content": prompt,
+            "model_type": "default",
+            "parent_message_id": parent,
+            "prompt": prompt,
+            "ref_file_ids": [],
+            "thinking_enabled": false,
+            "search_enabled": false,
         });
-        if !prompt.is_empty() {
-            payload["thinking_enabled"] = serde_json::Value::Bool(false);
-        }
 
         let mut rb = Self::request(
             &client,
@@ -183,34 +194,79 @@ impl DeepSeekProvider {
         Self::parse_completion_stream(&text)
     }
 
-    /// Completion bodies arrive as newline-separated JSON fragments:
-    /// `{"p":...}` progress chunks and a final `{"v": {"content": ..., "message_id"?}}`.
+    /// Completion bodies are newline-delimited JSON chunks (ds2api
+    /// `internal/sse` semantics):
+    ///   - `{"p": "response/content", "o": "APPEND", "v": "text"}` — content patch
+    ///   - `{"p": "...status...", "v": ...}` — status patches, never content
+    ///   - `{"response_message_id": N}` or `{"v": {"response": {"message_id": N}}}`
+    ///     or `{"message": {"response": {"message_id": N}}}` — assistant message id
     fn parse_completion_stream(text: &str) -> anyhow::Result<(String, String)> {
         let mut content = String::new();
         let mut message_id = String::new();
         for line in text.lines() {
             let line = line.trim();
-            if line.is_empty() {
+            if line.is_empty() || !line.starts_with("data:") && !line.starts_with('{') {
                 continue;
             }
-            let v: serde_json::Value = match serde_json::from_str(line) {
+            let json_str = line.strip_prefix("data: ").unwrap_or(line).trim();
+            if json_str == "[DONE]" {
+                continue;
+            }
+            let v: serde_json::Value = match serde_json::from_str(json_str) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            // fragment mode: append incremental content
-            if let Some(frag) = v["v"].as_str() {
-                content.push_str(frag);
-                continue;
+
+            // --- message id observation (consumer.go observeResponseMessageID) ---
+            if let Some(id) = Self::extract_int(&v["response_message_id"])
+                .or_else(|| Self::extract_int(&v["v"]["response"]["message_id"]))
+                .or_else(|| Self::extract_int(&v["message"]["response"]["message_id"]))
+            {
+                message_id = id.to_string();
             }
-            if let Some(frag) = v["v"]["content"].as_str() {
-                content.push_str(frag);
-            }
-            let mid = v["v"]["message_id"]
-                .as_str()
-                .map(String::from)
-                .or_else(|| v["v"]["message_id"].as_i64().map(|i| i.to_string()));
-            if let Some(id) = mid {
-                message_id = id;
+
+            // --- content patches ---
+            let path = v["p"].as_str().unwrap_or("").trim().to_string();
+            match path.as_str() {
+                "response/content" | "content" => {
+                    if let Some(s) = v["v"].as_str() {
+                        content.push_str(s);
+                    } else if let Some(s) = v["v"]["text"].as_str() {
+                        content.push_str(s);
+                    } else if let Some(s) = v["v"]["content"].as_str() {
+                        content.push_str(s);
+                    }
+                }
+                "" => {
+                    // bare {"v": "text"} fragments and final response objects
+                    if let Some(s) = v["v"].as_str() {
+                        // a bare string v is only content when it is not a status word
+                        let upper = s.to_uppercase();
+                        if upper != "WIP" && upper != "FINISHED" && upper != "CONTENT_FILTER" {
+                            content.push_str(s);
+                        }
+                    } else if let Some(resp) = v["v"]["response"]
+                        .as_object()
+                        .or_else(|| v["message"]["response"].as_object())
+                    {
+                        if let Some(fragments) = resp.get("fragments").and_then(|f| f.as_array()) {
+                            for frag in fragments {
+                                let t = frag["type"].as_str().unwrap_or("").to_uppercase();
+                                if matches!(t.as_str(), "RESPONSE" | "") {
+                                    if let Some(c) = frag["content"].as_str() {
+                                        content.push_str(c);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // status/metadata paths carry no content — skip explicitly
+                p if p.contains("status")
+                    || p.contains("token_usage")
+                    || p.contains("elapsed_secs")
+                    || p.contains("quasi_status") => {}
+                _ => {}
             }
         }
         if content.is_empty() {
@@ -219,6 +275,11 @@ impl DeepSeekProvider {
             );
         }
         Ok((content, message_id))
+    }
+
+    fn extract_int(v: &serde_json::Value) -> Option<i64> {
+        v.as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
     }
 }
 
@@ -341,6 +402,8 @@ impl DeepSeekProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     fn server() -> mockito::ServerGuard {
         mockito::Server::new()
@@ -395,14 +458,24 @@ mod tests {
         s.mock("POST", "/api/v0/chat/create_pow_challenge")
             .with_status(404)
             .create();
-        let completion = s
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let sink = captured.clone();
+        let _completion = s
             .mock("POST", "/api/v0/chat/completion")
             .match_header("authorization", "Bearer tok")
+            .with_body_from_request(move |req| {
+                *sink.lock() = Some(String::from_utf8_lossy(req.body().unwrap()).to_string());
+                // ds2api-style chunks: status patch, content patch, message id
+                concat!(
+                    "{\"p\":\"response/status\",\"v\":\"WIP\"}\n",
+                    "{\"p\":\"response/content\",\"o\":\"APPEND\",\"v\":\"deep \"}\n",
+                    "{\"p\":\"response/content\",\"o\":\"APPEND\",\"v\":\"answer\"}\n",
+                    "{\"response_message_id\":501,\"p\":\"response/status\",\"v\":\"FINISHED\"}\n"
+                )
+                .as_bytes()
+                .to_vec()
+            })
             .with_status(200)
-            .with_body(concat!(
-                "{\"p\":\"progress\"}\n",
-                "{\"v\":{\"content\":\"deep answer\",\"message_id\":501}}\n"
-            ))
             .create();
         let url = s.url();
 
@@ -413,7 +486,18 @@ mod tests {
         assert_eq!(resp.content, "deep answer");
         assert_eq!(resp.conversation_id, "sess-77");
         assert_eq!(resp.message_id, "501");
-        let _ = completion;
+        // payload must mirror ds2api CompletionPayload exactly
+        let payload_raw = captured.lock().take().expect("request body captured");
+        let payload: serde_json::Value = serde_json::from_str(&payload_raw).unwrap();
+        assert_eq!(payload["chat_session_id"], "sess-77");
+        assert_eq!(payload["model_type"], "default");
+        assert!(
+            payload["parent_message_id"].is_null(),
+            "fresh turn: null parent"
+        );
+        assert_eq!(payload["prompt"], "hi");
+        assert_eq!(payload["thinking_enabled"], false);
+        assert_eq!(payload["search_enabled"], false);
     }
 
     #[test]
@@ -426,9 +510,19 @@ mod tests {
         s.mock("POST", "/api/v0/chat/create_pow_challenge")
             .with_status(404)
             .create();
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let sink = captured.clone();
         s.mock("POST", "/api/v0/chat/completion")
+            .with_body_from_request(move |req| {
+                *sink.lock() = Some(String::from_utf8_lossy(req.body().unwrap()).to_string());
+                concat!(
+                    "{\"p\":\"response/content\",\"o\":\"APPEND\",\"v\":\"chunk two\"}\n",
+                    "{\"v\":{\"response\":{\"message_id\":9,\"status\":\"FINISHED\"}}}\n"
+                )
+                .as_bytes()
+                .to_vec()
+            })
             .with_status(200)
-            .with_body("{\"v\":\"chunk \"}\n{\"v\":{\"content\":\"two\",\"message_id\":\"9\"}}\n")
             .create();
         let url = s.url();
 
@@ -443,6 +537,13 @@ mod tests {
         assert_eq!(resp.content, "chunk two");
         assert_eq!(resp.conversation_id, "sess-existing");
         assert_eq!(resp.message_id, "9");
+        let payload_raw = captured.lock().take().expect("request body captured");
+        let payload: serde_json::Value = serde_json::from_str(&payload_raw).unwrap();
+        assert_eq!(
+            payload["parent_message_id"], 42,
+            "continue must send int parent"
+        );
+        assert_eq!(payload["chat_session_id"], "sess-existing");
     }
 
     #[test]
@@ -471,14 +572,39 @@ mod tests {
     }
 
     #[test]
-    fn parse_completion_accumulates_fragments_and_final_ids() {
+    fn parse_completion_accumulates_content_patches_and_ids() {
+        let (content, mid) = DeepSeekProvider
+            .parse_completion_for_test(concat!(
+                "{\"p\":\"response/status\",\"v\":\"WIP\"}\n",
+                "{\"p\":\"response/content\",\"o\":\"APPEND\",\"v\":\"a\"}\n",
+                "{\"p\":\"response/content\",\"o\":\"APPEND\",\"v\":\"b\"}\n",
+                "{\"response_message_id\":7,\"p\":\"response/status\",\"v\":\"FINISHED\"}\n"
+            ))
+            .unwrap();
+        assert_eq!(content, "ab");
+        assert_eq!(mid, "7");
+    }
+
+    #[test]
+    fn parse_completion_reads_wrapped_response_fragments() {
         let (content, mid) = DeepSeekProvider
             .parse_completion_for_test(
-                "{\"v\":\"a\"}\n{\"v\":\"b\"}\n{\"v\":{\"content\":\"c\",\"message_id\":7}}\n",
+                r#"{"message":{"response":{"message_id":11,"status":"FINISHED","fragments":[{"type":"THINKING","content":"hmm"},{"type":"RESPONSE","content":"final text"}]}}}"#,
             )
             .unwrap();
-        assert_eq!(content, "abc");
-        assert_eq!(mid, "7");
+        // thinking fragments are dropped; only RESPONSE text is content
+        assert_eq!(content, "final text");
+        assert_eq!(mid, "11");
+    }
+
+    #[test]
+    fn parse_completion_ignores_status_words_as_content() {
+        let (content, _) = DeepSeekProvider
+            .parse_completion_for_test(
+                "{\"p\":\"response/content\",\"o\":\"APPEND\",\"v\":\"real\"}\n{\"v\":\"FINISHED\"}\n{\"v\":\"WIP\"}\n",
+            )
+            .unwrap();
+        assert_eq!(content, "real");
     }
 
     #[test]
