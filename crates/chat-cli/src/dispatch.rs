@@ -37,7 +37,10 @@ async fn run_subcommand(cmd: Command, global: &Args) -> anyhow::Result<()> {
                 println!("default_provider: {:?}", cfg.default_provider);
                 for (k, v) in &cfg.providers {
                     let has_token = v.session_token.is_some();
-                    println!("  {}: logged_in={} expiry={:?}", k, has_token, v.access_token_expiry);
+                    println!(
+                        "  {}: logged_in={} expiry={:?}",
+                        k, has_token, v.access_token_expiry
+                    );
                 }
                 Ok(())
             }
@@ -85,7 +88,10 @@ async fn run_subcommand(cmd: Command, global: &Args) -> anyhow::Result<()> {
         Command::Config { cmd } => match cmd {
             ConfigCmd::Set { key, value } => {
                 if key != "default_provider" {
-                    anyhow::bail!("unknown config key '{}' (only 'default_provider' supported)", key);
+                    anyhow::bail!(
+                        "unknown config key '{}' (only 'default_provider' supported)",
+                        key
+                    );
                 }
                 let mut cfg = Config::load(config_path)?;
                 cfg.default_provider = Some(value.clone());

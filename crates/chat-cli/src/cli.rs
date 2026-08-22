@@ -112,8 +112,6 @@ impl Args {
 
     /// Effective prompt: -p takes precedence over positional.
     pub fn effective_prompt(&self) -> Option<&str> {
-        self.prompt
-            .as_deref()
-            .or(self.prompt_positional.as_deref())
+        self.prompt.as_deref().or(self.prompt_positional.as_deref())
     }
 }
