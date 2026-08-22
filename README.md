@@ -17,6 +17,10 @@
 
 `chat-cli` brings ChatGPT and DeepSeek web sessions to the terminal — so your 3 a.m. plan-review loop becomes a single piped command instead of a copy-paste ritual.
 
+<p align="center">
+  <em>rust cli · chatgpt · deepseek · llm · terminal · ai-agent · multi-provider · headless</em>
+</p>
+
 <div align="center">
 
 ```bash
