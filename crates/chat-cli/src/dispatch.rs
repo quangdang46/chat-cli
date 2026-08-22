@@ -140,9 +140,15 @@ async fn auth_login(
         .await
         .context("auth task panicked")??;
     if !session.valid {
-        anyhow::bail!(
-            "token rejected by '{provider_id}' — not saved. Re-check the cookie/token and retry."
-        );
+        let hint = match provider_id {
+            "chatgpt" => {
+                "copy __Secure-next-auth.session-token exactly via \
+DevTools → Application → Cookies"
+            }
+            "deepseek" => "re-copy your DeepSeek userToken (web session token) and retry",
+            _ => "re-check the token and retry",
+        };
+        anyhow::bail!("token rejected by '{provider_id}' — not saved. {hint}.");
     }
 
     let mut cfg = Config::load(config_path)?;
@@ -421,6 +427,22 @@ mod tests {
         Arc::new(Mutex::new(Vec::new()))
     });
 
+    static REGISTERED_FAILING: LazyLock<()> = LazyLock::new(|| {
+        inventory::submit! {
+            chat_core::provider::ProviderEntry {
+                id: "failingprov",
+                factory: || Box::new(TestProvider {
+                    calls: test_calls(),
+                    fail_auth: true,
+                }),
+            }
+        }
+    });
+
+    fn ensure_failing_registered() {
+        LazyLock::force(&REGISTERED_FAILING);
+    }
+
     fn test_calls() -> Arc<Mutex<Vec<String>>> {
         REGISTERED.clone()
     }
@@ -457,6 +479,25 @@ mod tests {
         let mut all = vec!["chat-cli"];
         all.extend_from_slice(args);
         Args::parse_from(all)
+    }
+
+    #[tokio::test]
+    async fn auth_login_rejection_carries_provider_hint() {
+        test_calls();
+        ensure_failing_registered();
+        let _env = temp_env();
+        let args = parse(&["auth", "login", "failingprov", "--token", "bad"]);
+        let err = run(args).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rejected by 'failingprov'") && msg.contains("not saved"),
+            "must name provider and refuse save: {msg}"
+        );
+        // nothing persisted
+        assert!(!Config::load(None)
+            .unwrap()
+            .providers
+            .contains_key("failingprov"));
     }
 
     #[tokio::test]
