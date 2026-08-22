@@ -100,7 +100,10 @@ async fn run_subcommand(cmd: Command, global: &Args) -> anyhow::Result<()> {
                 let cfg = Config::load(config_path)?;
                 match key.as_str() {
                     "default_provider" => println!("{:?}", cfg.default_provider),
-                    _ => anyhow::bail!("unknown config key '{}'", key),
+                    _ => anyhow::bail!(
+                        "unknown config key '{}' (only 'default_provider' supported)",
+                        key
+                    ),
                 }
                 Ok(())
             }
@@ -165,6 +168,14 @@ DevTools → Application → Cookies"
 }
 async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
     let config_path = args.config.as_deref().map(Path::new);
+    let verbose = args.verbose;
+
+    // All -v diagnostics go to stderr; stdout stays clean for piping.
+    macro_rules! vlog {
+        ($($arg:tt)*) => {
+            if verbose { eprintln!("[verbose] {}", format_args!($($arg)*)); }
+        };
+    }
 
     // 1. Resolve provider: --provider flag > config.toml default_provider > error
     let cfg = Config::load(config_path)?;
@@ -178,19 +189,48 @@ async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
         );
     };
 
-    let provider = chat_core::provider::get_provider(&provider_id)
-        .ok_or_else(|| anyhow::anyhow!("unknown provider '{}'", provider_id))?;
+    let provider = chat_core::provider::get_provider(&provider_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown provider '{}'. Registered: {:?}",
+            provider_id,
+            chat_core::provider::list_providers()
+        )
+    })?;
+    vlog!(
+        "provider resolved: {provider_id} (context_limit={})",
+        provider.context_limit()
+    );
 
     // 2. Attach
     let files = chat_core::attach::resolve_attachments(&args.attach)?;
     let attachments_text = provider.prepare_attachments(&files)?;
     let stdin_text = chat_core::attach::maybe_read_stdin_as_attachment(!files.is_empty())?;
     let attachments_text = format!("{}{}", attachments_text, stdin_text);
+    vlog!(
+        "attachments: {} file(s), {} chars (stdin: {})",
+        files.len(),
+        attachments_text.len(),
+        !stdin_text.is_empty()
+    );
 
     // 3. History
     let (handle, history_text) = resolve_history(&args, &provider_id)?;
+    vlog!(
+        "history: conversation_id={:?} parent_message_id={:?} context_chars={}",
+        handle.conversation_id,
+        handle.parent_message_id,
+        history_text.len()
+    );
 
     // 4. Budget check (fail fast with breakdown)
+    vlog!(
+        "budget: system={} history={} attachments={} prompt={} limit={}",
+        args.system.as_deref().map(str::len).unwrap_or(0),
+        history_text.len(),
+        attachments_text.len(),
+        prompt.len(),
+        provider.context_limit()
+    );
     chat_core::budget::budget_check(
         args.system.as_deref(),
         &history_text,

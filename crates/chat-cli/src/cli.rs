@@ -7,6 +7,8 @@
 //! chat-cli history list/show/rm
 //! ```
 
+#[cfg(test)]
+use clap::CommandFactory;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -113,5 +115,72 @@ impl Args {
     /// Effective prompt: -p takes precedence over positional.
     pub fn effective_prompt(&self) -> Option<&str> {
         self.prompt.as_deref().or(self.prompt_positional.as_deref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Args {
+        let mut all = vec!["chat-cli"];
+        all.extend_from_slice(args);
+        Args::parse_from(all)
+    }
+
+    #[test]
+    fn effective_prompt_p_flag_wins_over_positional() {
+        let args = parse(&["-p", "from-flag", "from-positional"]);
+        assert_eq!(args.effective_prompt(), Some("from-flag"));
+
+        let args = parse(&["only-positional"]);
+        assert_eq!(args.effective_prompt(), Some("only-positional"));
+
+        let args = parse(&["--new"]);
+        assert_eq!(args.effective_prompt(), None);
+    }
+
+    #[test]
+    fn new_and_continue_conflict() {
+        let result = Args::try_parse_from(["chat-cli", "--new", "--continue", "abc", "-p", "x"]);
+        assert!(result.is_err(), "--new + --continue must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("cannot be used with") || err.contains("conflict"),
+            "clap conflict error expected: {err}"
+        );
+    }
+
+    #[test]
+    fn continue_without_value_defaults_to_empty_string() {
+        let args = parse(&["--continue", "-p", "x"]);
+        assert_eq!(args.continue_id.as_deref(), Some(""));
+
+        let args = parse(&["--continue", "explicit-id", "-p", "x"]);
+        assert_eq!(args.continue_id.as_deref(), Some("explicit-id"));
+    }
+
+    /// Help snapshot — frozen for POC; README examples depend on these flags.
+    #[test]
+    fn help_snapshot_lists_frozen_surface() {
+        let help = Args::command().render_help().to_string();
+        for flag in [
+            "--provider",
+            "--config",
+            "--verbose",
+            "--prompt",
+            "--system",
+            "--attach",
+            "--new",
+            "--continue",
+        ] {
+            assert!(help.contains(flag), "help must document {flag}:\n{help}");
+        }
+        for sub in ["auth", "history", "config"] {
+            assert!(
+                help.contains(sub),
+                "help must list '{sub}' subcommand:\n{help}"
+            );
+        }
     }
 }

@@ -62,7 +62,11 @@ fn expand_glob_or_push(pattern: &str, out: &mut Vec<PathBuf>) -> anyhow::Result<
             matched = true;
         }
         if !matched {
-            anyhow::bail!("glob pattern '{}' matched no files", pattern);
+            anyhow::bail!(
+                "glob pattern '{}' matched no files — check the pattern from the repo root, \
+or use '-a @filelist.txt' with a line-delimited list",
+                pattern
+            );
         }
     } else {
         let p = PathBuf::from(pattern);
