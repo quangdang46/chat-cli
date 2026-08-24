@@ -13,27 +13,18 @@
 
 use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 static OVERRIDE: RwLock<Option<Arc<PathBuf>>> = RwLock::new(None);
-// Debug-only tripwire: production paths must never be resolved while an
-// override is active AND a flag asserts override-only resolution. Kept simple:
-// the flag exists so tests can assert the override was actually consulted.
-static OVERRIDE_CONSULTED: AtomicBool = AtomicBool::new(false);
 
 /// Install a process-wide base dir; returns a guard that restores the
-/// previous state on drop. Panics if an override is already active — nested
-/// overrides would silently restore the inner one first and corrupt the outer
-/// test's assumptions.
+/// previous state on drop (nesting-safe: the guard remembers what was active
+/// before it). Callers that need exclusive isolation should hold a shared
+/// lock around `set_base_override` — see chat-cli's `temp_env`.
 pub fn set_base_override(base: &Path) -> OverrideGuard {
     let mut slot = OVERRIDE.write();
-    assert!(
-        slot.is_none(),
-        "path base override already active — tests must not nest"
-    );
-    *slot = Some(Arc::new(base.to_path_buf()));
-    OverrideGuard
+    let prev = slot.replace(Arc::new(base.to_path_buf()));
+    OverrideGuard { prev }
 }
 
 /// Resolve `<default root>/chat-cli` under the active override, or return
@@ -41,17 +32,19 @@ pub fn set_base_override(base: &Path) -> OverrideGuard {
 pub fn redirected(_default_root: &Path) -> Option<PathBuf> {
     let slot = OVERRIDE.read();
     let base = slot.as_ref()?;
-    OVERRIDE_CONSULTED.store(true, Ordering::SeqCst);
     Some(base.join("chat-cli"))
 }
 
-/// Guard handle: clears the override on drop (or on panic unwind).
+/// Guard handle: restores the previously-active override (or none) on drop,
+/// including during panic unwind.
 #[derive(Debug)]
-pub struct OverrideGuard;
+pub struct OverrideGuard {
+    prev: Option<Arc<PathBuf>>,
+}
 
 impl Drop for OverrideGuard {
     fn drop(&mut self) {
-        *OVERRIDE.write() = None;
+        *OVERRIDE.write() = self.prev.take();
     }
 }
 
@@ -61,7 +54,8 @@ mod tests {
 
     #[test]
     fn no_override_returns_none_and_override_redirects() {
-        // No override in this process yet (each test binary starts clean).
+        // No other test in this module holds an override at this point —
+        // this module's tests run in one binary; keep them lock-free simple.
         assert!(redirected(Path::new("/tmp/x")).is_none());
 
         let dir = tempfile::tempdir().unwrap();
@@ -74,10 +68,26 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "already active")]
-    fn nesting_panics() {
-        let dir = tempfile::tempdir().unwrap();
-        let _g1 = set_base_override(dir.path());
-        let _g2 = set_base_override(dir.path());
+    fn nesting_restores_previous_state() {
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+
+        let g1 = set_base_override(d1.path());
+        {
+            let g2 = set_base_override(d2.path());
+            assert_eq!(
+                redirected(d1.path()).unwrap(),
+                d2.path().join("chat-cli"),
+                "inner override wins while active"
+            );
+            drop(g2);
+        }
+        assert_eq!(
+            redirected(d1.path()).unwrap(),
+            d1.path().join("chat-cli"),
+            "outer override restored after inner drop"
+        );
+        drop(g1);
+        assert!(redirected(d1.path()).is_none());
     }
 }

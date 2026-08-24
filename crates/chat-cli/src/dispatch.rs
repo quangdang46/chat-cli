@@ -591,12 +591,16 @@ mod tests {
     }
 
     struct TempEnv {
-        // mutating it must not overlap (TempDir drop would yank the path out
-        // from under a concurrent test).
-        _guard: parking_lot::MutexGuard<'static, ()>,
+        // Drop order matters: fields drop in declaration order. The override
+        // guard MUST drop before the lock guard — otherwise the next test can
+        // acquire HOME_LOCK while the previous test's path override is still
+        // installed (CI race: "path base override already active").
         _paths_guard: chat_core::paths::OverrideGuard,
         _dir: tempfile::TempDir,
         config: PathBuf,
+        // mutating it must not overlap (TempDir drop would yank the path out
+        // from under a concurrent test).
+        _guard: parking_lot::MutexGuard<'static, ()>,
     }
 
     static HOME_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -614,10 +618,10 @@ mod tests {
         let paths_guard = chat_core::paths::set_base_override(dir.path());
         let config = dir.path().join("chat-cli").join("config.toml");
         TempEnv {
-            _guard: guard,
             _paths_guard: paths_guard,
-            config,
             _dir: dir,
+            config,
+            _guard: guard,
         }
     }
 
