@@ -45,6 +45,13 @@ impl HistoryFile {
         if let Some(p) = override_path {
             return p.to_path_buf();
         }
+        // Test-only redirect (#1): keeps tests off the real user history —
+        // on Windows Known Folders ignore $HOME so env-var tricks don't work.
+        if let Some(p) = crate::paths::redirected(
+            &dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")),
+        ) {
+            return p.join("history");
+        }
         dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("chat-cli")

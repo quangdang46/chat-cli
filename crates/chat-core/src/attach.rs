@@ -147,17 +147,10 @@ fn build_stdin_attachment(buf: String) -> anyhow::Result<String> {
 }
 
 fn atty_check() -> bool {
-    #[cfg(unix)]
-    {
-        // Use isatty via libc if available; fallback to true (no stdin).
-        // We avoid adding `atty` dep — just check if stdin is a tty via std.
-        use std::io::IsTerminal;
-        std::io::stdin().is_terminal()
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    // std's IsTerminal is cross-platform (fixes #2: Windows previously
+    // hardcoded `true`, so piped stdin was never read as an attachment).
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
 }
 
 #[cfg(test)]

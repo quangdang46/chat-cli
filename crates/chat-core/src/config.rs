@@ -39,6 +39,13 @@ impl Config {
         if let Some(p) = override_path {
             return p.to_path_buf();
         }
+        // Test-only redirect (#1): on Windows Known Folders ignore $HOME, so
+        // tests install a base override instead of touching the real config.
+        if let Some(p) = crate::paths::redirected(
+            &dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")),
+        ) {
+            return p.join("config.toml");
+        }
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("chat-cli")

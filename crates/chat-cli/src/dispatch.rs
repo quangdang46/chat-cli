@@ -34,14 +34,7 @@ async fn run_subcommand(cmd: Command, global: &Args) -> anyhow::Result<()> {
                 set_default,
             } => auth_login(&provider, token, set_default, config_path).await,
             AuthCmd::Default { provider } => {
-                let p = chat_core::provider::get_provider(&provider).is_some();
-                if !p {
-                    anyhow::bail!(
-                        "unknown provider '{}'. Registered: {:?}",
-                        provider,
-                        chat_core::provider::list_providers()
-                    );
-                }
+                ensure_known_provider(&provider)?;
                 let mut cfg = Config::load(config_path)?;
                 cfg.default_provider = Some(provider.clone());
                 cfg.save(config_path)?;
@@ -90,13 +83,20 @@ async fn run_subcommand(cmd: Command, global: &Args) -> anyhow::Result<()> {
                 Ok(())
             }
             HistoryCmd::Show { id } => {
-                let hf = HistoryFile::load(&id, None)?;
+                let hf = load_history_or_not_found(&id)?;
                 println!("{}", serde_json::to_string_pretty(&hf)?);
                 Ok(())
             }
             HistoryCmd::Rm { id } => {
                 let path = HistoryFile::history_dir(None).join(format!("{}.jsonl", id));
-                std::fs::remove_file(&path)?;
+                // Map missing dir/file to a clean message instead of a raw OS
+                // error (fixes #4: Windows reports os error 3 for the absent
+                // history dir, which read like a crash).
+                if !path.exists() {
+                    anyhow::bail!("history entry '{id}' not found (run 'chat-cli history list' to see ids)");
+                }
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("failed to remove history entry '{id}'"))?;
                 println!("removed {}", id);
                 Ok(())
             }
@@ -109,6 +109,9 @@ async fn run_subcommand(cmd: Command, global: &Args) -> anyhow::Result<()> {
                         key
                     );
                 }
+                // Validate against registered providers — a garbage value here
+                // would silently break every later chat call (#5).
+                ensure_known_provider(&value)?;
                 let mut cfg = Config::load(config_path)?;
                 cfg.default_provider = Some(value.clone());
                 cfg.save(config_path)?;
@@ -128,6 +131,31 @@ async fn run_subcommand(cmd: Command, global: &Args) -> anyhow::Result<()> {
             }
         },
     }
+}
+
+/// Reject unknown provider ids with the registered list — shared by
+/// `auth default` and `config set default_provider`.
+fn ensure_known_provider(provider_id: &str) -> anyhow::Result<()> {
+    if chat_core::provider::get_provider(provider_id).is_none() {
+        anyhow::bail!(
+            "unknown provider '{}'. Registered: {:?}",
+            provider_id,
+            chat_core::provider::list_providers()
+        );
+    }
+    Ok(())
+}
+
+/// Load a history entry with a clean "not found" message instead of a raw
+/// filesystem error (#4).
+fn load_history_or_not_found(id: &str) -> anyhow::Result<HistoryFile> {
+    let path = HistoryFile::history_dir(None).join(format!("{}.jsonl", id));
+    if !path.exists() {
+        anyhow::bail!(
+            "history entry '{id}' not found (run 'chat-cli history list' to see ids)"
+        );
+    }
+    HistoryFile::load(id, None)
 }
 
 /// `auth login <provider> [--token ...] [--default]`: print copy-paste
@@ -544,6 +572,7 @@ mod tests {
         // mutating it must not overlap (TempDir drop would yank the path out
         // from under a concurrent test).
         _guard: parking_lot::MutexGuard<'static, ()>,
+        _paths_guard: chat_core::paths::OverrideGuard,
         _dir: tempfile::TempDir,
         config: PathBuf,
     }
@@ -552,28 +581,20 @@ mod tests {
 
     /// Redirect per-user dirs into a temp dir for one test.
     ///
-    /// Platform notes:
-    /// - macOS/Linux: `dirs` derives everything from `$HOME`, so setting HOME
-    ///   is enough.
-    /// - Windows: `dirs` uses Known-Folder APIs which IGNORE env vars — so the
-    ///   config/history paths captured here are only meaningful on unix. Tests
-    ///   that assert file layout must go through these fields, never re-derive
-    ///   from HOME, and assertions that depend on redirected paths are skipped
-    ///   on Windows (CI runs the same tests everywhere; the Windows-specific
-    ///   path handling is exercised by production code, not by HOME tricks).
+    /// Uses the chat-core process-global base override instead of `$HOME`:
+    /// on Windows Known-Folder APIs ignore env vars entirely, so the previous
+    /// HOME trick silently left tests reading/writing/deleting the REAL user
+    /// config and history (#1). The override is honored by both
+    /// `Config::config_path` and `HistoryFile::history_dir` on every platform.
     fn temp_env() -> TempEnv {
         let guard = HOME_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", dir.path());
-        // Both unix and Windows: ask dirs for the real base. On unix HOME
-        // redirection works; on Windows Known Folders ignore env vars, so
-        // history isolation comes from clear_history_dir() instead.
-        let config = dirs::config_dir()
-            .expect("config dir must resolve")
-            .join("chat-cli");
+        let paths_guard = chat_core::paths::set_base_override(dir.path());
+        let config = dir.path().join("chat-cli").join("config.toml");
         TempEnv {
             _guard: guard,
-            config: config.join("config.toml"),
+            _paths_guard: paths_guard,
+            config,
             _dir: dir,
         }
     }
@@ -655,9 +676,8 @@ mod tests {
         print_token_snippets("unknownprov"); // silent
     }
 
-    /// Remove every history file — tests assert deltas, and on Windows the
-    /// history dir is the real %LOCALAPPDATA% path (Known Folders ignore
-    /// HOME), so absolute counts are meaningless across parallel tests.
+    /// Remove every history file — tests assert deltas. Resolves under the
+    /// active test override (see `temp_env`), never the real user history (#1).
     fn clear_history_dir() {
         let dir = chat_core::history::HistoryFile::history_dir(None);
         if dir.exists() {

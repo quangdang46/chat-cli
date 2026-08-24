@@ -66,6 +66,11 @@ impl DeepSeekProvider {
     /// Probe an authenticated endpoint; cheap proof that the token works.
     /// `fetch_page` is a GET with query params (ds2api client_session.go:196),
     /// not a POST.
+    ///
+    /// DeepSeek returns HTTP 200 with an application-level error envelope
+    /// (`{"code":40003,"msg":"Authorization Failed (invalid token)","data":null}`)
+    /// for bad tokens (#3), so a 2xx status alone proves nothing — the body's
+    /// `code`/`data` must be checked too.
     fn probe_token(probe_url: &str, token: &str) -> anyhow::Result<bool> {
         let client = Self::http_client().context("failed to build HTTP client")?;
         let resp = Self::request(
@@ -84,6 +89,15 @@ impl DeepSeekProvider {
         }
         if !status.is_success() {
             bail!("deepseek probe returned {status}: endpoint unavailable, retry later");
+        }
+
+        // Application-level rejection inside a 200 envelope.
+        let body: serde_json::Value = resp.json().context(
+            "invalid JSON from deepseek probe — endpoint unavailable or shape changed",
+        )?;
+        let app_code = body["code"].as_i64().unwrap_or(0);
+        if app_code != 0 {
+            return Ok(false);
         }
         Ok(true)
     }
@@ -449,6 +463,26 @@ mod tests {
 
         let ok = DeepSeekProvider
             .probe_token_for_test(&url, "stale")
+            .unwrap();
+        assert!(!ok);
+    }
+
+    /// Live DeepSeek returns HTTP 200 with `{"code":40003,...}` for bad
+    /// tokens (#3) — the probe must treat that as rejection, not success.
+    #[test]
+    fn auth_rejected_token_maps_app_error_envelope_to_invalid() {
+        let mut s = server();
+        s.mock(
+            "GET",
+            mockito::Matcher::Regex(r"^/api/v0/chat_session/fetch_page\?.*".to_string()),
+        )
+        .with_status(200)
+        .with_body(r#"{"code":40003,"msg":"Authorization Failed (invalid token)","data":null}"#)
+        .create();
+        let url = s.url();
+
+        let ok = DeepSeekProvider
+            .probe_token_for_test(&url, "fake-token-xyz")
             .unwrap();
         assert!(!ok);
     }
