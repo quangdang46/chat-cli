@@ -189,6 +189,21 @@ async fn auth_login(
                 .context("failed reading token from terminal (no TTY?); pass --token instead")?
         }
     };
+    // Oversized ChatGPT JWTs are chunked by the browser into
+    // `__Secure-next-auth.session-token.0` + `.1`; users paste the parts
+    // joined with commas — concatenate them back into one token (#snippet UX).
+    let token = if provider_id == "chatgpt" && token.contains(',') {
+        let merged: String = token
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .concat();
+        eprintln!("[info] merged {} cookie parts into one token", merged.len());
+        merged
+    } else {
+        token
+    };
 
     let token_for_auth = token.clone();
     let session = tokio::task::spawn_blocking(move || provider.auth(&token_for_auth))
@@ -197,8 +212,8 @@ async fn auth_login(
     if !session.valid {
         let hint = match provider_id {
             "chatgpt" => {
-                "copy __Secure-next-auth.session-token exactly via \
-DevTools → Application → Cookies"
+                "copy the __Secure-next-auth.session-token cookie Value(s) via \
+DevTools → Application → Cookies (join .0/.1 parts with commas)"
             }
             "deepseek" => "re-copy your DeepSeek userToken (web session token) and retry",
             _ => "re-check the token and retry",
@@ -230,11 +245,18 @@ DevTools → Application → Cookies"
 /// to print (and copy) the session token without hunting through panels.
 fn print_token_snippets(provider_id: &str) {
     let snippet = match provider_id {
+        // `__Secure-next-auth.session-token` is HttpOnly — document.cookie can
+        // NEVER see it, so no console one-liner exists. Worse, oversized JWTs
+        // are chunked into `.0`/`.1` cookies; users must copy BOTH values and
+        // join them (comma-separated works — auth login merges the parts).
         "chatgpt" => concat!(
-            "// 1. Open https://chatgpt.com (logged in)\n",
-            "// 2. DevTools (F12) → Console → paste:\n",
-            "copy(document.cookie.split('; ').find(c => c.startsWith('__Secure-next-auth.session-token=')).split('=')[1])\n",
-            "// Token is now in your clipboard — paste it here."
+            "// No console one-liner possible: the cookie is HttpOnly.\n",
+            "// 1. Open https://chatgpt.com (logged in), press F12\n",
+            "// 2. Application tab → Storage → Cookies → https://chatgpt.com\n",
+            "// 3. Copy Value of '__Secure-next-auth.session-token.0'\n",
+            "//    (if '.1' exists too, copy it as well)\n",
+            "// 4. Run, joining multiple parts with commas:\n",
+            "//    chat-cli auth login chatgpt --token <value0>[,<value1>]"
         ),
         "deepseek" => concat!(
             "// 1. Open https://chat.deepseek.com (logged in)\n",
@@ -622,6 +644,30 @@ mod tests {
             .unwrap()
             .providers
             .contains_key("failingprov"));
+    }
+
+    #[test]
+    fn merge_chunked_chatgpt_cookie_parts() {
+        // Mirrors the merge logic in auth_login: comma-separated
+        // `.0`/`.1` cookie values concatenate into one token.
+        let raw = "part0,part1";
+        let merged: String = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(merged, "part0part1");
+
+        // whitespace + empty segments tolerated
+        let raw = " part0 , ,part1 ";
+        let merged: String = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(merged, "part0part1");
     }
 
     #[tokio::test]
