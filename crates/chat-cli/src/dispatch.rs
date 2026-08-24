@@ -65,42 +65,44 @@ async fn run_subcommand(cmd: Command, global: &Args) -> anyhow::Result<()> {
                 Ok(())
             }
         },
-        Command::History { cmd } => match cmd {
-            HistoryCmd::List { provider, limit } => {
-                let mut items = HistoryFile::list(None)?;
-                if let Some(p) = provider {
-                    items.retain(|h| h.provider == p);
+        Command::History { cmd } => {
+            match cmd {
+                HistoryCmd::List { provider, limit } => {
+                    let mut items = HistoryFile::list(None)?;
+                    if let Some(p) = provider {
+                        items.retain(|h| h.provider == p);
+                    }
+                    if let Some(n) = limit {
+                        items.truncate(n);
+                    }
+                    for h in items {
+                        println!(
+                            "{}  {}  {}  ({} turns)  {}",
+                            h.id, h.provider, h.created_at, h.turn_count, h.preview
+                        );
+                    }
+                    Ok(())
                 }
-                if let Some(n) = limit {
-                    items.truncate(n);
+                HistoryCmd::Show { id } => {
+                    let hf = load_history_or_not_found(&id)?;
+                    println!("{}", serde_json::to_string_pretty(&hf)?);
+                    Ok(())
                 }
-                for h in items {
-                    println!(
-                        "{}  {}  {}  ({} turns)  {}",
-                        h.id, h.provider, h.created_at, h.turn_count, h.preview
-                    );
+                HistoryCmd::Rm { id } => {
+                    let path = HistoryFile::history_dir(None).join(format!("{}.jsonl", id));
+                    // Map missing dir/file to a clean message instead of a raw OS
+                    // error (fixes #4: Windows reports os error 3 for the absent
+                    // history dir, which read like a crash).
+                    if !path.exists() {
+                        anyhow::bail!("history entry '{id}' not found (run 'chat-cli history list' to see ids)");
+                    }
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("failed to remove history entry '{id}'"))?;
+                    println!("removed {}", id);
+                    Ok(())
                 }
-                Ok(())
             }
-            HistoryCmd::Show { id } => {
-                let hf = load_history_or_not_found(&id)?;
-                println!("{}", serde_json::to_string_pretty(&hf)?);
-                Ok(())
-            }
-            HistoryCmd::Rm { id } => {
-                let path = HistoryFile::history_dir(None).join(format!("{}.jsonl", id));
-                // Map missing dir/file to a clean message instead of a raw OS
-                // error (fixes #4: Windows reports os error 3 for the absent
-                // history dir, which read like a crash).
-                if !path.exists() {
-                    anyhow::bail!("history entry '{id}' not found (run 'chat-cli history list' to see ids)");
-                }
-                std::fs::remove_file(&path)
-                    .with_context(|| format!("failed to remove history entry '{id}'"))?;
-                println!("removed {}", id);
-                Ok(())
-            }
-        },
+        }
         Command::Config { cmd } => match cmd {
             ConfigCmd::Set { key, value } => {
                 if key != "default_provider" {
@@ -151,9 +153,7 @@ fn ensure_known_provider(provider_id: &str) -> anyhow::Result<()> {
 fn load_history_or_not_found(id: &str) -> anyhow::Result<HistoryFile> {
     let path = HistoryFile::history_dir(None).join(format!("{}.jsonl", id));
     if !path.exists() {
-        anyhow::bail!(
-            "history entry '{id}' not found (run 'chat-cli history list' to see ids)"
-        );
+        anyhow::bail!("history entry '{id}' not found (run 'chat-cli history list' to see ids)");
     }
     HistoryFile::load(id, None)
 }

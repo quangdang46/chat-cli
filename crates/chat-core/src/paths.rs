@@ -11,10 +11,10 @@
 //! default config/history path resolves inside it. Production binaries never
 //! call `set_base_override`, so runtime behavior is unchanged.
 
+use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 static OVERRIDE: RwLock<Option<Arc<PathBuf>>> = RwLock::new(None);
 // Debug-only tripwire: production paths must never be resolved while an
@@ -66,8 +66,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let guard = set_base_override(dir.path());
-        let p = redirected(Path::new("/tmp/ignored"))
-            .expect("override must redirect");
+        let p = redirected(Path::new("/tmp/ignored")).expect("override must redirect");
         assert_eq!(p, dir.path().join("chat-cli"));
         drop(guard);
 

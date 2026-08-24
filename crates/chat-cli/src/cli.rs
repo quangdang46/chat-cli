@@ -12,7 +12,11 @@ use clap::CommandFactory;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "chat-cli", about = "Chat with ChatGPT/DeepSeek web via CLI", version)]
+#[command(
+    name = "chat-cli",
+    about = "Chat with ChatGPT/DeepSeek web via CLI",
+    version
+)]
 pub struct Args {
     /// Provider override (chatgpt | deepseek)
     #[arg(long, global = true)]

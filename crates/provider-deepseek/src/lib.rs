@@ -92,9 +92,9 @@ impl DeepSeekProvider {
         }
 
         // Application-level rejection inside a 200 envelope.
-        let body: serde_json::Value = resp.json().context(
-            "invalid JSON from deepseek probe — endpoint unavailable or shape changed",
-        )?;
+        let body: serde_json::Value = resp
+            .json()
+            .context("invalid JSON from deepseek probe — endpoint unavailable or shape changed")?;
         let app_code = body["code"].as_i64().unwrap_or(0);
         if app_code != 0 {
             return Ok(false);
