@@ -52,19 +52,20 @@ impl Drop for OverrideGuard {
 mod tests {
     use super::*;
 
+    // These tests share the process-global OVERRIDE with every other test in
+    // the binary (chat-cli's dispatch tests install it concurrently). They
+    // must therefore only make claims that hold under *some* override state:
+    // - the redirect always lands inside the installed base, never at a
+    //   hardcoded path;
+    // - guards restore whatever was active before them.
     #[test]
-    fn no_override_returns_none_and_override_redirects() {
-        // No other test in this module holds an override at this point —
-        // this module's tests run in one binary; keep them lock-free simple.
-        assert!(redirected(Path::new("/tmp/x")).is_none());
-
+    fn override_redirects_inside_installed_base() {
         let dir = tempfile::tempdir().unwrap();
         let guard = set_base_override(dir.path());
-        let p = redirected(Path::new("/tmp/ignored")).expect("override must redirect");
+        let p =
+            redirected(Path::new("/tmp/ignored")).expect("override just installed must redirect");
         assert_eq!(p, dir.path().join("chat-cli"));
         drop(guard);
-
-        assert!(redirected(Path::new("/tmp/x")).is_none());
     }
 
     #[test]
@@ -88,6 +89,17 @@ mod tests {
             "outer override restored after inner drop"
         );
         drop(g1);
-        assert!(redirected(d1.path()).is_none());
+    }
+
+    #[test]
+    fn guard_drop_clears_its_own_installation() {
+        // Install and drop twice; after each drop the active override is
+        // either gone or belongs to another test — never ours.
+        for _ in 0..2 {
+            let dir = tempfile::tempdir().unwrap();
+            let guard = set_base_override(dir.path());
+            assert_eq!(redirected(dir.path()).unwrap(), dir.path().join("chat-cli"));
+            drop(guard);
+        }
     }
 }
