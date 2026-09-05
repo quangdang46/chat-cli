@@ -9,7 +9,11 @@ use anyhow::Result;
 #[allow(unused_imports)]
 use provider_chatgpt as _chatgpt_link;
 #[allow(unused_imports)]
+use provider_claude as _claude_link;
+#[allow(unused_imports)]
 use provider_deepseek as _deepseek_link;
+#[allow(unused_imports)]
+use provider_gemini as _gemini_link;
 
 #[tokio::main]
 async fn main() -> Result<()> {

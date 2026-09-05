@@ -31,7 +31,7 @@ Codex / the OpenAI API don't replace this: they are single-backend, API-key only
 
 ### Out (POC)
 
-- `--json` machine output, `--model` switching, MCP wrapper — deferred.
+- `--json` machine output, MCP wrapper — deferred. (`--model` switching and the `claude` / `gemini` providers have since landed.)
 - Server-side `GET /backend-api/conversations` listing and websocket — POC's `history list` is local only.
 - Token-aware tokenizer — POC uses byte/char count against `context_limit()`.
 
@@ -296,7 +296,7 @@ chat-cli/
 
 ## 10. Not In This POC
 
-`--json` output, `--model` switching, MCP wrapper, server-side conversation listing, token-aware tokenizer, background daemon — all deferred. Each is additive on top of this plan (no redesign needed: `--json` is a new `dispatch` output layer, MCP is a new `crates/chat-mcp` that reuses `chat-core`).
+`--json` output, MCP wrapper, server-side conversation listing, token-aware tokenizer, background daemon — all deferred. (`--model` plus the `claude` and `gemini` providers landed after the POC.) Each is additive on top of this plan (no redesign needed: `--json` is a new `dispatch` output layer, MCP is a new `crates/chat-mcp` that reuses `chat-core`).
 
 ---
 

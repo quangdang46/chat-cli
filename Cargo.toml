@@ -5,6 +5,8 @@ members = [
     "crates/deepseek-pow",
     "crates/provider-chatgpt",
     "crates/provider-deepseek",
+    "crates/provider-claude",
+    "crates/provider-gemini",
     "crates/chat-cli",
 ]
 
@@ -32,14 +34,17 @@ clap = { version = "4.5", features = ["derive"] }
 toml = "0.8"
 dirs = "5.0"
 glob = "0.3"
-uuid = { version = "1.8", features = ["v4"] }
+uuid = { version = "1.8", features = ["v4", "v5"] }
 chrono = { version = "0.4", features = ["serde"] }
 inventory = "0.3"
 thiserror = "2.0"
 base64 = "0.22"
 sha3 = "0.10"
+regex = "1"
 tempfile = "3"
 chat-core = { path = "crates/chat-core" }
 deepseek-pow = { path = "crates/deepseek-pow" }
 provider-chatgpt = { path = "crates/provider-chatgpt" }
 provider-deepseek = { path = "crates/provider-deepseek" }
+provider-claude = { path = "crates/provider-claude" }
+provider-gemini = { path = "crates/provider-gemini" }

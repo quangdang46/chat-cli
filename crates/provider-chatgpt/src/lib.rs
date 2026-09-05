@@ -460,12 +460,11 @@ mod tests {
         let sink = persisted.clone();
         let auth = AuthContext {
             session_token: Some("rolling-token".to_string()),
-            access_token: None,
-            access_token_expiry: None,
             persist: Some(Arc::new(move |t: &str, e: &str| {
                 *sink.lock() = Some((t.to_string(), e.to_string()));
                 Ok(())
             })),
+            ..AuthContext::default()
         };
 
         let fresh = ChatGptProvider
@@ -514,7 +513,7 @@ mod tests {
             session_token: None,
             access_token: Some("cached".to_string()),
             access_token_expiry: Some(future),
-            persist: None,
+            ..AuthContext::default()
         };
         let got = ChatGptProvider
             .ensure_fresh_access_token_for_test(&auth, "http://127.0.0.1:9/unreachable")
@@ -536,7 +535,7 @@ mod tests {
             session_token: Some("rolling-token".to_string()),
             access_token: Some("stale".to_string()),
             access_token_expiry: Some(past),
-            persist: None,
+            ..AuthContext::default()
         };
         let got = ChatGptProvider
             .ensure_fresh_access_token_for_test(&auth, &url)
@@ -584,6 +583,7 @@ mod tests {
             prompt: "hi".to_string(),
             system: None,
             attachments_text: String::new(),
+            model: None,
             auth: AuthContext::default(),
         }
     }

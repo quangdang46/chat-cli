@@ -3,7 +3,7 @@ name = "chat-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CLI for chatting with ChatGPT/DeepSeek web via terminal"
+description = "CLI for chatting with ChatGPT/Claude/DeepSeek/Gemini web via terminal"
 
 [[bin]]
 name = "chat-cli"
@@ -13,6 +13,8 @@ path = "src/main.rs"
 chat-core = { workspace = true }
 provider-chatgpt = { workspace = true }
 provider-deepseek = { workspace = true }
+provider-claude = { workspace = true }
+provider-gemini = { workspace = true }
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

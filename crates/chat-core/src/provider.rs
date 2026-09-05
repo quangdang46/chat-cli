@@ -26,6 +26,9 @@ pub struct ChatReq {
     pub system: Option<String>,
     /// Already-prepared attachments text (via `prepare_attachments`).
     pub attachments_text: String,
+    /// Model selector: `--model` flag > `[providers.<id>].model` config.
+    /// Providers with a fixed backend model ignore it.
+    pub model: Option<String>,
     /// Authenticated session material + persistence target for rolling refresh.
     /// Populated by the dispatcher from `config.toml`; providers that need
     /// tokens (all web providers) read it here and may write refreshed values
@@ -224,6 +227,7 @@ mod tests {
                     prompt: "hi".to_string(),
                     system: None,
                     attachments_text: String::new(),
+                    model: None,
                     auth: AuthContext::default(),
                 },
             )

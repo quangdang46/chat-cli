@@ -1,9 +1,9 @@
 //! CLI surface — clap definitions.
 //!
 //! ```text
-//! chat-cli auth login <chatgpt|deepseek> [--token ...]
+//! chat-cli auth login <chatgpt|claude|deepseek|gemini> [--token ...]
 //! chat-cli auth status | logout <provider>
-//! chat-cli -p "prompt" [--provider x] [-s sys] [-a ...] [--new|--continue[<id>]]
+//! chat-cli -p "prompt" [--provider x] [--model m] [-s sys] [-a ...] [--new|--continue[<id>]]
 //! chat-cli history list/show/rm
 //! ```
 
@@ -14,11 +14,11 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(
     name = "chat-cli",
-    about = "Chat with ChatGPT/DeepSeek web via CLI",
+    about = "Chat with ChatGPT/Claude/DeepSeek/Gemini web via CLI",
     version
 )]
 pub struct Args {
-    /// Provider override (chatgpt | deepseek)
+    /// Provider override (chatgpt | claude | deepseek | gemini)
     #[arg(long, global = true)]
     pub provider: Option<String>,
 
@@ -48,6 +48,10 @@ pub struct Args {
     /// Attach files: repeatable, comma-separated, glob, @list.txt
     #[arg(short = 'a', long = "attach", value_name = "FILE")]
     pub attach: Vec<String>,
+
+    /// Model override for this turn (falls back to [providers.<id>].model)
+    #[arg(short = 'm', long, global = true)]
+    pub model: Option<String>,
 
     /// Force new conversation
     #[arg(long = "new", conflicts_with = "continue_id")]
@@ -169,6 +173,16 @@ mod tests {
         assert_eq!(args.continue_id.as_deref(), Some("explicit-id"));
     }
 
+    #[test]
+    fn model_flag_parses() {
+        let args = parse(&["-p", "hi", "--model", "claude-sonnet-4-6-thinking"]);
+        assert_eq!(args.model.as_deref(), Some("claude-sonnet-4-6-thinking"));
+        assert_eq!(args.effective_prompt(), Some("hi"));
+
+        let args = parse(&["-p", "hi"]);
+        assert!(args.model.is_none());
+    }
+
     /// Help snapshot — frozen for POC; README examples depend on these flags.
     #[test]
     fn help_snapshot_lists_frozen_surface() {
@@ -180,6 +194,7 @@ mod tests {
             "--prompt",
             "--system",
             "--attach",
+            "--model",
             "--new",
             "--continue",
         ] {

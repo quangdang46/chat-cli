@@ -8,6 +8,13 @@
 //! access_token_expiry = "2026-08-21T00:00:00Z"
 //! [providers.deepseek]
 //! session_token = "..."
+//! [providers.claude]
+//! session_token = "sk-ant-sid01-..."  # sessionKey cookie
+//! model = "claude-sonnet-4-6"
+//! [providers.gemini]
+//! session_token = "..."             # __Secure-1PSID cookie
+//! access_token = "..."              # __Secure-1PSIDTS cookie (rolling)
+//! model = "gemini-flash"
 //! ```
 
 use std::collections::HashMap;
@@ -32,6 +39,11 @@ pub struct ProviderConfig {
     pub access_token: Option<String>,
     #[serde(default)]
     pub access_token_expiry: Option<String>,
+    /// Per-provider model selector (e.g. `claude-sonnet-4-6`,
+    /// `claude-sonnet-4-6-thinking`, `gemini-flash`). Providers without model
+    /// support ignore it; `--model` on the CLI overrides it for one turn.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl Config {
@@ -103,6 +115,7 @@ mod tests {
                 session_token: Some("session-token-1".to_string()),
                 access_token: Some("access-token-1".to_string()),
                 access_token_expiry: Some("2026-09-01T00:00:00Z".to_string()),
+                ..Default::default()
             },
         );
         cfg.providers.insert(
@@ -111,6 +124,7 @@ mod tests {
                 session_token: Some("ds-token".to_string()),
                 access_token: None,
                 access_token_expiry: None,
+                ..Default::default()
             },
         );
         cfg
@@ -147,6 +161,39 @@ mod tests {
         let deepseek = loaded.providers.get("deepseek").unwrap();
         assert_eq!(deepseek.session_token.as_deref(), Some("ds-token"));
         assert!(deepseek.access_token.is_none());
+    }
+
+    #[test]
+    fn model_round_trip_and_missing_fields_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut cfg = Config::default();
+        cfg.providers.insert(
+            "claude".to_string(),
+            ProviderConfig {
+                session_token: Some("sk-ant-sid01-x".to_string()),
+                model: Some("claude-sonnet-4-6".to_string()),
+                ..Default::default()
+            },
+        );
+        cfg.save(Some(&path)).unwrap();
+
+        let loaded = Config::load(Some(&path)).unwrap();
+        let entry = loaded.providers.get("claude").unwrap();
+        assert_eq!(entry.model.as_deref(), Some("claude-sonnet-4-6"));
+
+        // Old-style config without the model key must still parse
+        let legacy = r#"
+[providers.chatgpt]
+session_token = "st"
+"#;
+        let legacy_path = dir.path().join("legacy.toml");
+        std::fs::write(&legacy_path, legacy).unwrap();
+        let loaded = Config::load(Some(&legacy_path)).unwrap();
+        let chatgpt = loaded.providers.get("chatgpt").unwrap();
+        assert_eq!(chatgpt.session_token.as_deref(), Some("st"));
+        assert!(chatgpt.model.is_none());
     }
 
     #[test]

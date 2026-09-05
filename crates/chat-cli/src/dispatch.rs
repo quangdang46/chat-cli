@@ -216,6 +216,14 @@ async fn auth_login(
 DevTools → Application → Cookies (join .0/.1 parts with commas)"
             }
             "deepseek" => "re-copy your DeepSeek userToken (web session token) and retry",
+            "claude" => {
+                "re-copy the sessionKey cookie via \
+DevTools → Application → Cookies on claude.ai and retry"
+            }
+            "gemini" => {
+                "re-copy __Secure-1PSID (+ __Secure-1PSIDTS) via \
+DevTools → Application → Cookies — the 1PSIDTS value expires quickly"
+            }
             _ => "re-check the token and retry",
         };
         anyhow::bail!("token rejected by '{provider_id}' — not saved. {hint}.");
@@ -263,6 +271,21 @@ fn print_token_snippets(provider_id: &str) {
             "// 2. DevTools (F12) → Console → paste:\n",
             "copy(JSON.parse(localStorage.getItem('userToken')).value)\n",
             "// Token is now in your clipboard — paste it here."
+        ),
+        "claude" => concat!(
+            "// 1. Open https://claude.ai (logged in)\n",
+            "// 2. DevTools (F12) → Application → Cookies → https://claude.ai\n",
+            "//    The sessionKey cookie is HttpOnly — copy its value manually.\n",
+            "// 3. Paste the value (starts with sk-ant-sid01-…) here."
+        ),
+        "gemini" => concat!(
+            "// 1. Open https://gemini.google.com (logged in)\n",
+            "// 2. DevTools (F12) → Application → Cookies → https://gemini.google.com\n",
+            "//    The cookies are HttpOnly, so the console cannot read them —\n",
+            "//    copy the values of __Secure-1PSID and __Secure-1PSIDTS manually.\n",
+            "// 3. Paste both as one line:\n",
+            "//    __Secure-1PSID=<value>; __Secure-1PSIDTS=<value>\n",
+            "// (a bare __Secure-1PSID value alone also works)"
         ),
         _ => return,
     };
@@ -344,6 +367,8 @@ async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
 
     // 5. Build ChatReq and call provider
     let pcfg = cfg.providers.get(&provider_id).cloned().unwrap_or_default();
+    // --model wins over [providers.<id>].model
+    let model = args.model.clone().or(pcfg.model.clone());
     let config_for_persist = config_path.map(|p| p.to_path_buf());
     let provider_id_for_persist = provider_id.clone();
     let auth = chat_core::provider::AuthContext {
@@ -368,6 +393,7 @@ async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
         prompt: prompt.clone(),
         system: args.system.clone(),
         attachments_text,
+        model,
         auth,
     };
 
@@ -377,8 +403,9 @@ async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
     } else {
         chat_core::provider::ChatReq {
             prompt: format!("{}{}", history_text, prompt),
-            system: args.system.clone(),
+            system: req.system,
             attachments_text: req.attachments_text,
+            model: req.model,
             auth: req.auth,
         }
     };
@@ -543,7 +570,8 @@ mod tests {
         ) -> anyhow::Result<chat_core::provider::ChatResp> {
             let mut calls = self.calls.lock();
             calls.push(format!(
-                "conv={:?} parent={:?} prompt={} auth={}",
+                "model={:?} conv={:?} parent={:?} prompt={} auth={}",
+                req.model,
                 handle.conversation_id,
                 handle.parent_message_id,
                 req.prompt,
@@ -792,6 +820,37 @@ mod tests {
             "stored ids must flow into ProviderHandle: {}",
             calls[0]
         );
+    }
+
+    #[tokio::test]
+    async fn chat_model_flag_overrides_config_model() {
+        test_calls();
+        let _env = temp_env();
+        clear_history_dir();
+        run(parse(&["auth", "login", "testprov", "--token", "s"]))
+            .await
+            .unwrap();
+        test_calls().lock().clear();
+
+        // No --model and no config model → None
+        run(parse(&["--new", "-p", "plain"])).await.unwrap();
+        assert!(
+            test_calls().lock()[0].contains("model=None"),
+            "no model configured: {:?}",
+            test_calls().lock()
+        );
+        test_calls().lock().clear();
+
+        // --model flag wins for the turn
+        run(parse(&["--new", "-p", "flagged", "--model", "m-flag"]))
+            .await
+            .unwrap();
+        assert!(
+            test_calls().lock()[0].contains("model=Some(\"m-flag\")"),
+            "--model must reach the provider: {:?}",
+            test_calls().lock()
+        );
+        clear_history_dir();
     }
 
     #[tokio::test]

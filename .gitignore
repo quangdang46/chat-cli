@@ -9,3 +9,6 @@ Cargo.lock
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# zcode session workspace
+.zcode/

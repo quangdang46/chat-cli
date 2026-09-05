@@ -18,7 +18,7 @@
 `chat-cli` brings ChatGPT and DeepSeek web sessions to the terminal — so your 3 a.m. plan-review loop becomes a single piped command instead of a copy-paste ritual.
 
 <p align="center">
-  <em>rust cli · chatgpt · deepseek · llm · terminal · ai-agent · multi-provider · headless</em>
+  <em>rust cli · chatgpt · claude · deepseek · gemini · llm · terminal · ai-agent · multi-provider · headless</em>
 </p>
 
 <div align="center">
@@ -31,7 +31,7 @@ chat-cli -p "tear this plan apart" -a ./PLAN.md --provider chatgpt
 
 </div>
 
-> **Origin:** You were iterating on plans by hand-feeding them to ChatGPT in a browser. `chat-cli` removes that bottleneck: `chat-cli -p "..." --provider chatgpt` with ` -a` file attachments, local history, and a `crates/*` provider architecture that stays open for Gemini, Claude, and whatever comes next — without ever touching core.
+> **Origin:** You were iterating on plans by hand-feeding them to ChatGPT in a browser. `chat-cli` removes that bottleneck: `chat-cli -p "..." --provider chatgpt` with ` -a` file attachments, local history, and a `crates/*` provider architecture — now shipping ChatGPT, Claude, DeepSeek and Gemini — all direct **web** providers (paste a cookie once, no paid API) — behind the same `Provider` trait.
 
 ---
 
@@ -113,7 +113,7 @@ chat-cli -v --config /tmp/my.toml -p "debug this"
 
 | Principle | How it shows up |
 |---|---|
-| Provider is an extension, not a fork | `crates/chat-core/src/provider.rs` defines `trait Provider`; each backend is `crates/provider-*` and self-registers via `inventory`. Adding Gemini is `cargo new crates/provider-gemini`, no core edit. |
+| Provider is an extension, not a fork | `crates/chat-core/src/provider.rs` defines `trait Provider`; each backend is `crates/provider-*` and self-registers via `inventory`. The Gemini and Claude providers landed exactly this way, and the next backend follows the same recipe — no core edit. |
 | Attachments travel with the request, not the browser | `crates/chat-core/src/attach.rs` resolves `-a` into `Vec<PathBuf>` then `prepare_attachments()` injects `<<<FILE: path>>>` fences by default; a provider can override to do real `/backend-api/files` upload. |
 | Budget fails loud, never silently truncates | `crates/chat-core/src/budget.rs` checks `system + history + attachments + prompt` against `context_limit()` and prints a per-segment breakdown so the agent can decide what to cut. |
 | History is local and honest | `crates/chat-core/src/history.rs` is append-only `~/.local/share/chat-cli/history/<id>.jsonl` with `provider_conversation_id` + `provider_parent_message_id` stored explicitly. Cross-provider `--continue` is rejected with a clear error. |
@@ -166,6 +166,18 @@ access_token_expiry = "2026-08-21T00:00:00Z"
 
 [providers.deepseek]
 session_token = "..."
+
+# Claude web (direct — sessionKey cookie from claude.ai)
+[providers.claude]
+session_token = "sk-ant-sid01-..."
+model = "claude-sonnet-4-6"                     # optional; "-thinking" suffix enables extended thinking
+
+
+# Gemini web (reverse-engineered; cookies from gemini.google.com)
+[providers.gemini]
+session_token = "__Secure-1PSID value"
+access_token = "__Secure-1PSIDTS value (rolling)"
+model = "gemini-flash"                          # optional; defaults to account default
 ```
 
 ```bash
@@ -189,6 +201,18 @@ chat-cli auth status                        # logged-in providers + expiry
 chat-cli auth logout chatgpt
 ```
 
+**Per-provider notes**
+
+- **claude** — same cookie-paste flow as ChatGPT: copy the `sessionKey` cookie
+  (DevTools → Application → Cookies → claude.ai; it is HttpOnly so the console
+  cannot read it) and run:
+  ```bash
+  chat-cli auth login claude --token "sk-ant-sid01-..."
+  ```
+  Validated live against `GET /api/account`; the org uuid is resolved per turn.
+
+- **gemini** — accepts a bare `__Secure-1PSID` value, both values separated by `;`, or a full cookie paste; `__Secure-1PSIDTS` is stored as the rolling cookie and refreshed automatically when Google rotates it.
+
 **Fast token capture** — `auth login` prints a ready-made console one-liner before
 prompting. Paste it into the provider site's DevTools console and the token lands
 in your clipboard, no panel-hunting:
@@ -201,23 +225,30 @@ copy(document.cookie.split('; ').find(c => c.startsWith('__Secure-next-auth.sess
 copy(JSON.parse(localStorage.getItem('userToken')).value)
 ```
 
+Gemini's cookies are `HttpOnly`, so the console cannot read them — `auth login gemini`
+prints panel instructions (DevTools → Application → Cookies → `gemini.google.com`)
+instead of a one-liner.
+
 Validation on `login`: the CLI immediately validates against the live endpoint
-(`GET /api/auth/session` for ChatGPT, session probe for DeepSeek) and reports
-success/failure — a bad paste is caught before it becomes a silent failure later.
+(`GET /api/auth/session` for ChatGPT, session probe for DeepSeek, an `SNlM0e`
+check for Gemini) and reports success/failure — a bad
+paste is caught before it becomes a silent failure later.
 `default_provider` semantics: first login sets it; later logins keep it unless you
 pass `--default` or run `chat-cli auth default <provider>`.
 
 ### `chat-cli` (chat)
 
 ```bash
-chat-cli -p "prompt" [--provider chatgpt|deepseek] [-s "system"] [-a FILE ...] [--new|--continue[ <id>]]
+chat-cli -p "prompt" [--provider chatgpt|claude|deepseek|gemini] [-s "system"] [-a FILE ...] [--model m] [--new|--continue[ <id>]]
 chat-cli "prompt"                            # positional alias for -p
 chat-cli --provider deepseek -p "..."        # override default
 chat-cli -p "..." -s "You are a reviewer."   # system prompt
+chat-cli --provider claude --model claude-sonnet-4-6-thinking -p "..."
 ```
 
 Flags:
 - `-a` repeatable, plus comma/glob/`@list.txt` and implicit `stdin`.
+- `--model` overrides `[providers.<id>].model` for this turn (e.g. `-thinking` on claude enables extended thinking without editing config).
 - `--new` forces a fresh local history file; `--continue` resumes, defaulting to the most recent history for the selected provider. A provider mismatch is a hard error (a ChatGPT `conversation_id` is meaningless to DeepSeek and vice versa).
 
 ### `chat-cli history`
@@ -261,6 +292,18 @@ provider-chatgpt (crates/provider-chatgpt)    provider-deepseek (crates/provider
                  chat-requirements, conversation
   lib.rs        — rolling session refresh,        lib.rs       — fetch_page probe, session create,
                  conversation POST + SSE parse                PoW, completion stream parse
+
+provider-claude (crates/provider-claude)
+  protocol.rs   — anthropic-client headers, completion payload, SSE parser
+                  (text/thinking deltas, repl/artifacts code-fence rebuild)
+  lib.rs        — /api/account org lookup, conversation create/continue,
+                  extended-thinking (paprika_mode) toggle, completion stream
+
+
+provider-gemini (crates/provider-gemini)
+  protocol.rs   — /app bootstrap extraction, 81-slot f.req builder, length-prefixed
+                  frame parser (UTF-16 units), candidate/error extraction
+  lib.rs        — 1PSID/1PSIDTS cookie auth, StreamGenerate turn, rolling 1PSIDTS persist
        │
 deepseek-pow (crates/deepseek-pow) — Keccak-f[1600] rounds 1..23 solver
   shared by both providers (DeepSeekHashV1 challenge format)
@@ -288,7 +331,11 @@ cargo new crates/provider-gemini --lib
 | `no assistant response found in conversation stream` / `no content found in deepseek completion stream` | Model refused, account flagged, or session expired mid-chat | Re-run `auth login`, try `--new`, or check the provider's web app |
 | `file '...' too large` / `total attachments too large` | Per-file 1 MB / total 5 MB guard | Split the file or pass fewer attachments |
 | `context limit ... exceeded: system=... history=... attachments=... prompt=...` | Combined input exceeds provider limit | Drop attachments, use `--new`, or shorten history; the breakdown tells you which segment to cut |
-| `auth login` reports invalid | Pasted token is wrong or the browser cookie name is different | ChatGPT: copy `__Secure-next-auth.session-token` exactly (DevTools → Application → Cookies); DeepSeek: copy the session token, then re-run with `--token` |
+| `auth login` reports invalid | Pasted token is wrong or the browser cookie name is different | ChatGPT: copy `__Secure-next-auth.session-token` exactly (DevTools → Application → Cookies); DeepSeek: copy the session token, then re-run with `--token`; Gemini: re-copy `__Secure-1PSID` + `__Secure-1PSIDTS` (the 1PSIDTS value expires quickly) |
+| `sessionKey rejected by claude.ai` / completion 401 | Claude web session expired or copied wrong | Re-copy the `sessionKey` cookie (DevTools → Application → Cookies) and re-run `auth login claude` |
+| `429 from claude.ai — usage limit` | Claude web quota window exhausted | Wait for the window to reset, or switch `--provider gemini` |
+| `init page carried no SNlM0e token` (gemini) | Cookies expired, region-blocked, or a guest page was served | Re-run `auth login gemini` with fresh cookies; try a proxy if your region blocks Gemini |
+| `usage limit exceeded` / `model header invalid` (gemini) | Account quota hit, or the static model table is stale | Switch `--model gemini-flash`, drop the model setting, or wait for the quota window |
 
 ---
 
@@ -298,6 +345,8 @@ cargo new crates/provider-gemini --lib
 - ChatGPT sentinel PoW is solved locally; Cloudflare Turnstile challenges beyond PoW are not handled.
 - History is local (`~/.local/share/chat-cli/history`). `history list` does not call the server-side `GET /backend-api/conversations` — that keeps it fast and offline, but a conversation created in the browser won't appear until the CLI creates it.
 - Budget check is byte/character-based in the POC; a token-aware estimator can replace it later without changing the trait.
+- Claude web: the `-thinking` model suffix flips the **account-level** extended-thinking setting (`paprika_mode`), the same switch the web UI uses — it is account-wide, not per-conversation. The `anthropic-client-sha` header tracks the web frontend and may need a bump when claude.ai ships a new build. claude.ai sits behind Cloudflare; if TLS fingerprinting starts blocking plain HTTP clients, the HTTP stack may need to switch to a browser-impersonating one (`rquest`) — same risk as Gemini.
+- Gemini web protocol is reverse-engineered and Google can change it without notice (field indices, frame format, bot checks). Error messages carry the raw error codes so breakage is diagnosable; if Google starts TLS-fingerprinting clients, the HTTP stack may need to switch to a browser-impersonating one (`rquest`).
 
 ---
 
@@ -307,7 +356,20 @@ cargo new crates/provider-gemini --lib
 The tab is fine for one-off questions. For an agent that needs to call `chat-cli -p "review PLAN.md" -a PLAN.md --provider chatgpt` a hundred times, a browser is a liability: it needs a window, a human, and manual file uploads. `chat-cli` does it headless and pipeably.
 
 **Why not just use Codex / the OpenAI API?**
-Codex already shares your ChatGPT quota (same web-session billing, not a separate API key bill), so quota isn't the differentiator — **breadth is**. Codex is OpenAI-only. `chat-cli` is multi-provider by design — DeepSeek today, Gemini/Claude next — behind the same `Provider` trait + `crates/provider-*` layout, so you can switch backends without rewriting core.
+Codex already shares your ChatGPT quota (same web-session billing, not a separate API key bill), so quota isn't the differentiator — **breadth is**. Codex is OpenAI-only. `chat-cli` is multi-provider by design — ChatGPT, Claude, DeepSeek and Gemini web, all driven the way their browser clients are — behind the same `Provider` trait + `crates/provider-*` layout, so you can switch backends without rewriting core.
+
+**How does Claude work — and where does claude2api fit?**
+Claude is a **direct web provider**, same philosophy as ChatGPT: paste the `sessionKey` cookie once, and chat-cli speaks the same endpoints the claude.ai web app does (`/api/account` for the org, `.../chat_conversations` create, `.../completion` SSE stream — including extended thinking via the account's `paprika_mode` setting and `--model claude-sonnet-4-6-thinking`). The protocol was mirrored from the MIT-licensed [claude2api](https://github.com/basketikun/claude2api) gateway, whose `internal/service` is itself a claude.ai web client; no code was copied, and no gateway needs to run.
+
+```bash
+chat-cli auth login claude --token "sk-ant-sid01-..."
+chat-cli --provider claude -p "hello Claude"
+chat-cli --provider claude --model claude-sonnet-4-6-thinking -p "think hard"
+```
+
+
+**How do I add a new provider?**
+Create `crates/provider-<name>`, implement `Provider { id, context_limit, auth, chat, prepare_attachments }`, and `inventory::submit!` it. `chat-core` and existing providers are unchanged — the architecture is deliberately open-closed.
 
 **How is the browser session kept alive?**
 The CLI stores the pasted `session_token` in `config.toml` and, before each chat, does the same rolling refresh the browser does: `GET /api/auth/session` → cache the short-lived `access_token` → persist any new `Set-Cookie` value. There is no background daemon; the next chat does the refresh.
@@ -316,7 +378,7 @@ The CLI stores the pasted `session_token` in `config.toml` and, before each chat
 Yes. `chat-cli auth login chatgpt --token "..."` is fully non-interactive, `stdin` is treated as an attachment when `-a` is empty, and all diagnostics go to `stderr` so `stdout` stays clean for piping.
 
 **How do I add Gemini as a provider?**
-Create `crates/provider-gemini`, implement `Provider { id, context_limit, auth, chat, prepare_attachments }`, and `inventory::submit!` it. `chat-core` and existing providers are unchanged — the architecture is deliberately open-closed.
+It's built in now — `chat-cli auth login gemini` (paste `__Secure-1PSID` + `__Secure-1PSIDTS` from DevTools → Application → Cookies). The implementation is a clean-room Rust port of the `gemini_webapi` protocol (that reference is AGPL-3.0; no code was copied, so chat-cli stays MIT).
 
 ---
 
