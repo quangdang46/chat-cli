@@ -258,9 +258,11 @@ impl ChatGptProvider {
 
     /// ChatGPT sentinel proof-of-work: brute-force `sha3_512(seed + base64)`
     /// until the hex prefix meets `difficulty`, wrapped in the `gAAAAAB`
-    /// marker (browser `_generateAnswer` scheme).
+    /// marker (browser `_generateAnswer` scheme). The server-controlled
+    /// difficulty is validated inside `solve_proof_token` (it once panicked
+    /// on oversized values).
     fn solve_sentinel_pow(pow: &protocol::PowRequired) -> anyhow::Result<String> {
-        Ok(protocol::solve_proof_token(&pow.seed, &pow.difficulty))
+        protocol::solve_proof_token(&pow.seed, &pow.difficulty)
     }
 
     /// Extract `(content, conversation_id, message_id)` from the SSE/JSONL

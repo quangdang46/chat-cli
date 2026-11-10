@@ -50,7 +50,13 @@ pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWeb
 /// FreeGPT35 `app.js`): brute-force an index into a base64(JSON) config array
 /// until `sha3_512(seed + base)` hex prefix <= difficulty, then prepend the
 /// `gAAAAAB` marker.
-pub fn solve_proof_token(seed: &str, difficulty: &str) -> String {
+///
+/// `difficulty` comes from the server and is UNTRUSTED: it must be a
+/// non-empty, even-length hex string of at most 128 chars. Anything else
+/// used to panic (`hex[..diff_len]` out of bounds) or silently emit a
+/// garbage token, so it is rejected up front.
+pub fn solve_proof_token(seed: &str, difficulty: &str) -> anyhow::Result<String> {
+    validate_difficulty(difficulty)?;
     let now = chrono::Utc::now() - chrono::Duration::hours(8);
     let parse_time = now
         .format("%a, %d %b %Y %H:%M:%S GMT-0500 (Eastern Time)")
@@ -85,13 +91,35 @@ pub fn solve_proof_token(seed: &str, difficulty: &str) -> String {
         let digest = hasher.finalize();
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         if &hex[..diff_len] <= difficulty {
-            return format!("gAAAAAB{base}");
+            return Ok(format!("gAAAAAB{base}"));
         }
     }
     // Fallback observed in reference impls when unsolved within attempts.
     use base64::Engine;
     let fallback = base64::engine::general_purpose::STANDARD.encode(format!("\"{seed}\""));
-    format!("gAAAAABwQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D{fallback}")
+    Ok(format!("gAAAAABwQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D{fallback}"))
+}
+
+/// Server-controlled `difficulty` sanity gate. The digest hex is 128 chars;
+/// `diff_len = difficulty.len() / 2` must stay within it, and a malformed or
+/// empty value must never reach the compare loop.
+fn validate_difficulty(difficulty: &str) -> anyhow::Result<()> {
+    if difficulty.is_empty() {
+        anyhow::bail!("sentinel PoW difficulty is empty — refusing to guess a token");
+    }
+    if difficulty.len() > 128 {
+        anyhow::bail!(
+            "sentinel PoW difficulty too long ({} chars, max 128) — server response is malformed",
+            difficulty.len()
+        );
+    }
+    if difficulty.len() % 2 != 0 {
+        anyhow::bail!("sentinel PoW difficulty must be an even-length hex string");
+    }
+    if !difficulty.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("sentinel PoW difficulty is not hex — refusing to solve");
+    }
+    Ok(())
 }
 
 /// `POST /sentinel/chat-requirements` — server decides whether a proof-of-work
@@ -261,18 +289,47 @@ mod tests {
 
     #[test]
     fn proof_token_has_gaaaaab_prefix_and_solves_low_difficulty() {
-        let token = solve_proof_token("0.9abcdef", "0003ff");
+        let token = solve_proof_token("0.9abcdef", "0003ff").unwrap();
         assert!(token.starts_with("gAAAAAB"), "prefix required: {token}");
     }
 
     #[test]
     fn proof_token_deterministic_for_same_seed_and_difficulty() {
-        let a = solve_proof_token("seed-x", "00ffff");
-        let b = solve_proof_token("seed-x", "00ffff");
+        let a = solve_proof_token("seed-x", "00ffff").unwrap();
+        let b = solve_proof_token("seed-x", "00ffff").unwrap();
         assert_eq!(
             a, b,
             "same inputs must give same token (fixed counter path)"
         );
+    }
+
+    /// Server-controlled `difficulty`: oversized values used to panic on the
+    /// `hex[..diff_len]` slice; empty/malformed values produced garbage.
+    #[test]
+    fn proof_token_rejects_hostile_difficulty_values() {
+        for bad in [
+            "",
+            &"f".repeat(130), // > 128 chars → used to panic
+            &"f".repeat(256), // far beyond the 128-char digest
+            "abc",            // odd length
+            "zzzz",           // not hex
+            "0.9",            // sentinel test fixture shape, not hex
+        ] {
+            let err = solve_proof_token("seed", bad).unwrap_err();
+            assert!(
+                err.to_string().contains("difficulty"),
+                "difficulty {bad:?} must fail with a difficulty error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn proof_token_accepts_boundary_difficulty_lengths() {
+        // 128 hex chars is the max allowed — must not panic. "f"*128 is the
+        // easiest possible prefix compare (every hex digit <= 'f'), so the
+        // solver returns on the first attempt instead of grinding 500k.
+        let token = solve_proof_token("seed", &"f".repeat(128)).unwrap();
+        assert!(token.starts_with("gAAAAAB"));
     }
 
     #[test]

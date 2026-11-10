@@ -14,6 +14,25 @@
 //!   - cooperative cancellation checked every 1024 nonces.
 
 use base64::Engine;
+use std::time::{Duration, Instant};
+
+/// Upper bound on a server-supplied `difficulty`. `difficulty` is the size
+/// of the nonce search space `[0, difficulty)` and arrives from an untrusted
+/// server response — a hostile or corrupt value (e.g. `i64::MAX`) would
+/// otherwise burn CPU forever. 50M nonces is far above any observed real
+/// challenge (the reference default is 144_000) while staying solvable in
+/// seconds on commodity hardware.
+pub const MAX_DIFFICULTY: i64 = 50_000_000;
+
+/// Wall-clock budget for one solve. Even at the clamped maximum, a slow
+/// machine or unlucky nonce layout must not hang a chat turn (the provider
+/// HTTP timeout is 120s; this leaves ample headroom).
+const SOLVE_TIME_BUDGET: Duration = Duration::from_secs(30);
+
+/// Clamp a server-supplied difficulty into `[0, MAX_DIFFICULTY]`.
+fn clamp_difficulty(difficulty: i64) -> i64 {
+    difficulty.clamp(0, MAX_DIFFICULTY)
+}
 
 /// Round constants for Keccak-f[1600] (index 0 is unused — round 0 skipped).
 const RC: [u64; 24] = [
@@ -170,17 +189,24 @@ fn decode_hex32(hex_str: &str) -> Option<[u8; 32]> {
 
 /// Search `nonce ∈ [0, difficulty)` such that
 /// `DeepSeekHashV1(prefix + str(nonce)) == challenge` — non-cancellable form.
+/// `difficulty` is clamped to `MAX_DIFFICULTY` and the search is bounded by
+/// `SOLVE_TIME_BUDGET` so a hostile server value cannot hang the caller.
 pub fn solve_pow(
     challenge_hex: &str,
     salt: &str,
     expire_at: i64,
     difficulty: i64,
 ) -> anyhow::Result<i64> {
-    solve_pow_with_cancel(challenge_hex, salt, expire_at, difficulty, || false)
+    let started = Instant::now();
+    solve_pow_with_cancel(challenge_hex, salt, expire_at, difficulty, move || {
+        started.elapsed() >= SOLVE_TIME_BUDGET
+    })
 }
 
 /// Cancellable solver: `should_stop` is polled every 1024 nonces
-/// (mirrors the reference's `ctx.Err()` checkpoint).
+/// (mirrors the reference's `ctx.Err()` checkpoint). `difficulty` is
+/// clamped to `[0, MAX_DIFFICULTY]` here so EVERY entry point — including
+/// direct callers of this function — is bounded against hostile servers.
 pub fn solve_pow_with_cancel(
     challenge_hex: &str,
     salt: &str,
@@ -188,6 +214,7 @@ pub fn solve_pow_with_cancel(
     difficulty: i64,
     mut should_stop: impl FnMut() -> bool,
 ) -> anyhow::Result<i64> {
+    let difficulty = clamp_difficulty(difficulty);
     if challenge_hex.len() != 64 {
         anyhow::bail!("pow: challenge must be 64 hex chars");
     }
@@ -427,6 +454,44 @@ mod tests {
         let challenge_hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
         let err = solve_pow(&challenge_hex, "testsalt", 1700000000, 42).unwrap_err();
         assert!(err.to_string().contains("no solution within difficulty"));
+    }
+
+    /// Server-controlled `difficulty` must be clamped: `i64::MAX` used to
+    /// mean an effectively infinite nonce search.
+    #[test]
+    fn difficulty_is_clamped_to_sane_bounds() {
+        assert_eq!(clamp_difficulty(i64::MAX), MAX_DIFFICULTY);
+        assert_eq!(clamp_difficulty(i64::MIN), 0);
+        assert_eq!(clamp_difficulty(-1), 0);
+        assert_eq!(clamp_difficulty(0), 0);
+        assert_eq!(clamp_difficulty(144_000), 144_000);
+        assert_eq!(clamp_difficulty(MAX_DIFFICULTY + 1), MAX_DIFFICULTY);
+    }
+
+    /// A hostile huge difficulty on a solvable challenge still resolves —
+    /// the nonce is found long before the clamp matters.
+    #[test]
+    fn solve_pow_survives_hostile_difficulty_values() {
+        let digest = deep_seek_hash_v1(b"testsalt_1700000000_42");
+        let challenge_hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+        // i64::MAX clamps to MAX_DIFFICULTY, which contains nonce 42.
+        let got = solve_pow(&challenge_hex, "testsalt", 1700000000, i64::MAX)
+            .expect("clamped solve must still find the nonce");
+        assert_eq!(got, 42);
+        // Non-positive difficulties clamp to an empty search space: a clean
+        // "no solution" error, never a hang.
+        for hostile in [i64::MIN, -1, 0] {
+            let err = solve_pow(&challenge_hex, "testsalt", 1700000000, hostile).unwrap_err();
+            assert!(err.to_string().contains("no solution"), "{err}");
+        }
+    }
+
+    #[test]
+    fn solve_pow_negative_difficulty_is_empty_search_not_hang() {
+        let digest = deep_seek_hash_v1(b"testsalt_1700000000_42");
+        let challenge_hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+        let err = solve_pow(&challenge_hex, "testsalt", 1700000000, -5).unwrap_err();
+        assert!(err.to_string().contains("no solution"), "{err}");
     }
 
     #[test]
