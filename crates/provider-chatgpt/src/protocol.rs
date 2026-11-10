@@ -28,11 +28,28 @@ pub struct SessionResponse {
 
 /// Stable per-install device id for `Oai-Device-Id` (the browser stores a
 /// uuid; any stable uuid satisfies the sentinel).
-pub fn device_id() -> String {
+///
+/// Resolution order: `[providers.chatgpt].device_id` in config.toml (loaded
+/// into `AuthContext::device_id` by the dispatcher) → a generated uuid that
+/// is persisted back through `AuthContext::persist_device_id` → the
+/// process-lifetime `OnceLock` fallback for callers without a persistence
+/// callback (tests).
+pub fn device_id(auth: &chat_core::provider::AuthContext) -> String {
     use std::sync::OnceLock;
-    static DEVICE: OnceLock<String> = OnceLock::new();
-    DEVICE
-        .get_or_init(|| uuid::Uuid::new_v4().to_string())
+    static GENERATED: OnceLock<String> = OnceLock::new();
+
+    if let Some(id) = auth.device_id.as_deref() {
+        return id.to_string();
+    }
+    GENERATED
+        .get_or_init(|| {
+            let id = uuid::Uuid::new_v4().to_string();
+            // Best-effort: a stable id across runs looks more like a real
+            // browser install. Failure (read-only config, tests) is
+            // non-fatal — the in-process id still satisfies the sentinel.
+            let _ = auth.save_device_id(&id);
+            id
+        })
         .clone()
 }
 
@@ -330,7 +347,27 @@ mod tests {
 
     #[test]
     fn device_id_is_stable_within_process() {
-        assert_eq!(device_id(), device_id());
-        assert!(device_id().len() >= 32);
+        let auth = chat_core::provider::AuthContext::default();
+        assert_eq!(device_id(&auth), device_id(&auth));
+        assert!(device_id(&auth).len() >= 32);
+    }
+
+    /// A configured device id wins over generation and is never persisted
+    /// back (nothing to learn).
+    #[test]
+    fn device_id_prefers_configured_value() {
+        let saved: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = saved.clone();
+        let auth = chat_core::provider::AuthContext {
+            device_id: Some("configured-id".to_string()),
+            persist_device_id: Some(std::sync::Arc::new(move |id: &str| {
+                sink.lock().unwrap().push(id.to_string());
+                Ok(())
+            })),
+            ..Default::default()
+        };
+        assert_eq!(device_id(&auth), "configured-id");
+        assert!(saved.lock().unwrap().is_empty());
     }
 }

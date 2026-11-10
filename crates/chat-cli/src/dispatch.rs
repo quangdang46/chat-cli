@@ -37,8 +37,9 @@ async fn run_subcommand(cmd: Command, global: &Args) -> anyhow::Result<()> {
             AuthCmd::Login {
                 provider,
                 token,
+                token_stdin,
                 set_default,
-            } => auth_login(&provider, token, set_default, config_path).await,
+            } => auth_login(&provider, token, token_stdin, set_default, config_path).await,
             AuthCmd::Default { provider } => {
                 ensure_known_provider(&provider)?;
                 let mut cfg = Config::load(config_path)?;
@@ -189,6 +190,7 @@ fn load_history_or_not_found(id: &str) -> anyhow::Result<HistoryFile> {
 async fn auth_login(
     provider_id: &str,
     token: Option<String>,
+    token_stdin: bool,
     set_default: bool,
     config_path: Option<&Path>,
 ) -> anyhow::Result<()> {
@@ -206,6 +208,20 @@ async fn auth_login(
 
     let token = match token {
         Some(t) => t,
+        None if token_stdin => {
+            // --token-stdin: the secret never touches argv. Read to EOF and
+            // trim the trailing newline `echo`/`printf` habits add.
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("failed reading token from stdin")?;
+            let trimmed = buf.trim().to_string();
+            if trimmed.is_empty() {
+                anyhow::bail!("--token-stdin: stdin was empty");
+            }
+            trimmed
+        }
         None => {
             // Non-TTY (piped stdin, CI, agent harness): rpassword would block
             // or consume the pipe — fail fast and tell the user to pass
@@ -214,7 +230,8 @@ async fn auth_login(
             if !std::io::stdin().is_terminal() {
                 anyhow::bail!(
                     "no --token given and stdin is not a TTY — rerun with \
-                     'chat-cli auth login {provider_id} --token <token>'"
+                     'chat-cli auth login {provider_id} --token <token>' or pipe the \
+                     token via --token-stdin"
                 );
             }
             eprint!("Paste session token for {provider_id}: ");
@@ -416,10 +433,22 @@ async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
     let model = args.model.clone().or(pcfg.model.clone());
     let config_for_persist = config_path.map(|p| p.to_path_buf());
     let provider_id_for_persist = provider_id.clone();
+    let config_for_device = config_for_persist.clone();
+    let provider_id_for_device = provider_id_for_persist.clone();
     let auth = chat_core::provider::AuthContext {
         session_token: pcfg.session_token,
         access_token: pcfg.access_token,
         access_token_expiry: pcfg.access_token_expiry,
+        device_id: pcfg.device_id,
+        persist_device_id: Some(std::sync::Arc::new(move |id: &str| -> anyhow::Result<()> {
+            let mut cfg = Config::load(config_for_device.as_deref())?;
+            let entry = cfg
+                .providers
+                .entry(provider_id_for_device.clone())
+                .or_default();
+            entry.device_id = Some(id.to_string());
+            cfg.save(config_for_device.as_deref())
+        })),
         persist: Some(std::sync::Arc::new(
             move |token: &str, expiry: &str| -> anyhow::Result<()> {
                 let mut cfg = Config::load(config_for_persist.as_deref())?;

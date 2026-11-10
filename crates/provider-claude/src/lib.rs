@@ -71,6 +71,13 @@ impl ClaudeProvider {
 
     /// `GET /api/account` — validates the cookie (auth) and yields the org uuid.
     fn fetch_org(account_url: &str, session_key: &str) -> anyhow::Result<String> {
+        let body = Self::fetch_account(account_url, session_key)?;
+        protocol::extract_org_uuid(&body)
+    }
+
+    /// `GET /api/account` returning the raw body text — chat needs the
+    /// settings section too (prior `paprika_mode` for restore).
+    fn fetch_account(account_url: &str, session_key: &str) -> anyhow::Result<String> {
         let client = Self::http_client().context("failed to build HTTP client")?;
         let resp = Self::request(&client, reqwest::Method::GET, account_url, session_key)
             .send()
@@ -83,26 +90,23 @@ impl ClaudeProvider {
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             bail!("429 from claude.ai — IP temporarily flagged; try a proxy or wait");
         }
-        let body = resp
-            .error_for_status()
+        resp.error_for_status()
             .map_err(Self::map_status)?
             .text()
-            .context("failed reading /api/account")?;
-        protocol::extract_org_uuid(&body)
+            .context("failed reading /api/account")
     }
 
-    /// `PUT /api/account` — flip the account's extended-thinking switch.
-    fn set_thinking(account_url: &str, session_key: &str, enabled: bool) -> anyhow::Result<()> {
+    /// `PUT /api/account` — set the account's `paprika_mode` (extended
+    /// thinking switch). This mutates SERVER-SIDE account state shared with
+    /// the user's claude.ai web session, so callers must restore the prior
+    /// value after the turn.
+    fn set_paprika(base: &str, session_key: &str, mode: Value) -> anyhow::Result<()> {
         let client = Self::http_client().context("failed to build HTTP client")?;
-        let payload = protocol::build_account_settings(if enabled {
-            Value::String("extended".into())
-        } else {
-            Value::Null
-        });
+        let payload = protocol::build_account_settings(mode);
         let resp = Self::request(
             &client,
             reqwest::Method::PUT,
-            &format!("{account_url}/api/account"),
+            &format!("{base}/api/account"),
             session_key,
         )
         .header("content-type", "application/json")
@@ -141,13 +145,14 @@ impl ClaudeProvider {
         })
     }
 
-    /// `POST .../completion` — stream one turn, return the folded text.
+    /// `POST .../completion` — stream one turn, return text + best-effort
+    /// message uuid.
     fn post_completion(
         completion_url: &str,
         session_key: &str,
         conversation: &str,
         payload: Value,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<protocol::CompletionOutcome> {
         let client = Self::http_client().context("failed to build HTTP client")?;
         let resp = Self::request(&client, reqwest::Method::POST, completion_url, session_key)
             .header("content-type", "application/json")
@@ -175,6 +180,103 @@ impl ClaudeProvider {
             .text()
             .context("failed reading completion stream")?;
         protocol::parse_completion_sse(&body)
+    }
+
+    /// Full turn flow parameterized over the site base URL (production
+    /// passes `protocol::BASE_URL`; tests pass the mock server URL — every
+    /// endpoint derives from it identically).
+    fn chat_flow(
+        handle: &ProviderHandle,
+        session_key: &str,
+        model: Option<String>,
+        system: Option<&str>,
+        prompt: &str,
+        attachments: Vec<Value>,
+        base: &str,
+    ) -> anyhow::Result<ChatResp> {
+        // -thinking suffix → extended mode + base model for the payloads.
+        let raw_model = model.unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+        let (thinking, model) = protocol::split_thinking_suffix(&raw_model);
+
+        // The completion payload has no dedicated system field; like the
+        // ChatGPT provider, the system prompt rides as a fenced prefix on
+        // the user prompt.
+        let prompt = match system {
+            Some(sys) => format!("[System instruction]: {sys}\n\n{prompt}"),
+            None => prompt.to_string(),
+        };
+
+        // One account fetch yields both the org uuid and the prior
+        // paprika_mode we must restore after the turn.
+        let account_body = Self::fetch_account(&format!("{base}/api/account"), session_key)?;
+        let account: Value =
+            serde_json::from_str(&account_body).context("invalid JSON from /api/account")?;
+        let org = protocol::extract_org_uuid_value(&account)?;
+        let prior_paprika = account["settings"]["paprika_mode"].clone();
+
+        if thinking {
+            Self::set_paprika(base, session_key, Value::String("extended".into()))
+                .context("failed to enable extended thinking on the account")?;
+        }
+
+        // Run the turn, then ALWAYS attempt to restore the account's
+        // thinking mode — the PUT above mutates server-side state shared
+        // with the user's claude.ai web session.
+        let result = (|| -> anyhow::Result<ChatResp> {
+            // --continue reuses the server-side conversation; --new creates one.
+            let conversation = match &handle.conversation_id {
+                Some(id) => id.clone(),
+                None => Self::create_conversation(
+                    &format!("{base}/api/organizations/{org}/chat_conversations"),
+                    session_key,
+                    model,
+                )?,
+            };
+
+            let outcome = Self::post_completion(
+                &format!(
+                    "{base}/api/organizations/{org}/chat_conversations/{conversation}/completion"
+                ),
+                session_key,
+                &conversation,
+                protocol::build_completion_payload(
+                    &prompt,
+                    model,
+                    attachments,
+                    handle.parent_message_id.as_deref(),
+                ),
+            )?;
+
+            Ok(ChatResp {
+                content: outcome.text,
+                conversation_id: conversation,
+                // Real message uuid when the stream carried one (becomes the
+                // next turn's parent_message_uuid); synthetic fallback keeps
+                // history bookkeeping working either way.
+                message_id: outcome
+                    .message_uuid
+                    .unwrap_or_else(|| format!("cl-{}", uuid::Uuid::new_v4())),
+            })
+        })();
+
+        if thinking {
+            // Restore best-effort: prior value when the account payload
+            // exposed it, else null (thinking off) — same end state the
+            // reference gateway leaves for non-think turns.
+            let restore = if prior_paprika.is_null() {
+                Value::Null
+            } else {
+                prior_paprika
+            };
+            if let Err(e) = Self::set_paprika(base, session_key, restore) {
+                eprintln!(
+                    "warning: could not restore claude.ai thinking mode after the turn — \
+                     check Settings on claude.ai ({e})"
+                );
+            }
+        }
+
+        result
     }
 }
 
@@ -209,38 +311,6 @@ impl Provider for ClaudeProvider {
             )
         })?;
 
-        // -thinking suffix → extended mode + base model for the payloads.
-        let raw_model = req
-            .model
-            .clone()
-            .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
-        let (thinking, model) = protocol::split_thinking_suffix(&raw_model);
-
-        let org = Self::fetch_org(protocol::organizations_url().as_str(), session_key)?;
-
-        if thinking {
-            Self::set_thinking(protocol::BASE_URL, session_key, true)
-                .context("failed to enable extended thinking on the account")?;
-        }
-
-        // --continue reuses the server-side conversation; --new creates one.
-        let conversation = match &handle.conversation_id {
-            Some(id) => id.clone(),
-            None => Self::create_conversation(
-                protocol::conversations_url(&org).as_str(),
-                session_key,
-                model,
-            )?,
-        };
-
-        // The completion payload has no dedicated system field; like the
-        // ChatGPT provider, the system prompt rides as a fenced prefix on
-        // the user prompt.
-        let prompt = match &req.system {
-            Some(sys) => format!("[System instruction]: {sys}\n\n{}", req.prompt),
-            None => req.prompt.clone(),
-        };
-
         // Attachments arrive as fenced text — ship them as a text attachment
         // so long context rides the same path the web app uses.
         let attachments = if req.attachments_text.is_empty() {
@@ -249,18 +319,15 @@ impl Provider for ClaudeProvider {
             vec![protocol::text_attachment(&req.attachments_text)]
         };
 
-        let content = Self::post_completion(
-            protocol::completion_url(&org, &conversation).as_str(),
+        Self::chat_flow(
+            handle,
             session_key,
-            &conversation,
-            protocol::build_completion_payload(&prompt, model, attachments),
-        )?;
-
-        Ok(ChatResp {
-            content,
-            conversation_id: conversation,
-            message_id: format!("cl-{}", uuid::Uuid::new_v4()),
-        })
+            req.model,
+            req.system.as_deref(),
+            &req.prompt,
+            attachments,
+            protocol::BASE_URL,
+        )
     }
 }
 
@@ -281,33 +348,10 @@ impl ClaudeProvider {
         base: &str,
         session_key: &str,
         model: Option<String>,
+        system: Option<&str>,
         prompt: &str,
     ) -> anyhow::Result<ChatResp> {
-        let raw_model = model.unwrap_or_else(|| "claude-sonnet-4-6".to_string());
-        let (thinking, model) = protocol::split_thinking_suffix(&raw_model);
-        let org = Self::fetch_org(&format!("{base}/api/account"), session_key)?;
-        if thinking {
-            Self::set_thinking(base, session_key, true)?;
-        }
-        let conversation = match &handle.conversation_id {
-            Some(id) => id.clone(),
-            None => Self::create_conversation(
-                &format!("{base}/api/organizations/{org}/chat_conversations"),
-                session_key,
-                model,
-            )?,
-        };
-        let content = Self::post_completion(
-            &format!("{base}/api/organizations/{org}/chat_conversations/{conversation}/completion"),
-            session_key,
-            &conversation,
-            protocol::build_completion_payload(prompt, model, Vec::new()),
-        )?;
-        Ok(ChatResp {
-            content,
-            conversation_id: conversation,
-            message_id: format!("cl-{}", uuid::Uuid::new_v4()),
-        })
+        Self::chat_flow(handle, session_key, model, system, prompt, Vec::new(), base)
     }
 }
 
@@ -419,7 +463,14 @@ mod tests {
         let url = s.url();
 
         let resp = ClaudeProvider
-            .chat_at_for_test(&ProviderHandle::default(), &url, "sk-ok", None, "hi claude")
+            .chat_at_for_test(
+                &ProviderHandle::default(),
+                &url,
+                "sk-ok",
+                None,
+                None,
+                "hi claude",
+            )
             .unwrap();
 
         assert_eq!(resp.content, "hello from claude");
@@ -469,7 +520,7 @@ mod tests {
             parent_message_id: Some("cl-prev".to_string()),
         };
         let resp = ClaudeProvider
-            .chat_at_for_test(&handle, &url, "sk-ok", None, "next")
+            .chat_at_for_test(&handle, &url, "sk-ok", None, None, "next")
             .unwrap();
         assert_eq!(resp.conversation_id, "conv-held");
         assert_eq!(resp.content, "second turn");
@@ -478,15 +529,17 @@ mod tests {
     #[test]
     fn chat_thinking_model_toggles_paprika_and_strips_suffix() {
         let mut s = server();
-        let paprika_hit: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-        let hit = paprika_hit.clone();
+        // thinking mode must be switched ON for the turn and restored OFF
+        // afterwards — the account payload carries no prior paprika_mode, so
+        // the restore value is null.
+        let paprika_bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let bodies = paprika_bodies.clone();
         let _paprika = s
             .mock("PUT", "/api/account")
             .match_header("cookie", "sessionKey=sk-ok")
             .with_body_from_request(move |req| {
                 let body = String::from_utf8_lossy(req.body().unwrap()).to_string();
-                assert!(body.contains("\"paprika_mode\":\"extended\""), "{body}");
-                *hit.lock() = true;
+                bodies.lock().push(body);
                 r#"{"ok":true}"#.as_bytes().to_vec()
             })
             .with_status(200)
@@ -523,14 +576,24 @@ mod tests {
                 &url,
                 "sk-ok",
                 Some("claude-sonnet-4-6-thinking".to_string()),
+                None,
                 "think",
             )
             .unwrap();
         assert_eq!(resp.content, "thoughtful");
+        let puts = paprika_bodies.lock();
+        assert_eq!(puts.len(), 2, "enable + restore PUTs expected: {puts:?}");
         assert!(
-            *paprika_hit.lock(),
-            "paprika toggle must fire for -thinking models"
+            puts[0].contains("\"paprika_mode\":\"extended\""),
+            "first PUT enables thinking: {}",
+            puts[0]
         );
+        assert!(
+            puts[1].contains("\"paprika_mode\":null"),
+            "second PUT must restore the prior (null) mode: {}",
+            puts[1]
+        );
+        drop(puts);
         let payload: serde_json::Value =
             serde_json::from_str(&completion_store.lock().take().unwrap()).unwrap();
         assert_eq!(
@@ -563,7 +626,7 @@ mod tests {
         let url = s.url();
 
         let err = ClaudeProvider
-            .chat_at_for_test(&ProviderHandle::default(), &url, "sk-ok", None, "hi")
+            .chat_at_for_test(&ProviderHandle::default(), &url, "sk-ok", None, None, "hi")
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("429") && msg.contains("usage limit"), "{msg}");
@@ -592,7 +655,7 @@ mod tests {
         let url = s.url();
 
         let err = ClaudeProvider
-            .chat_at_for_test(&ProviderHandle::default(), &url, "dead", None, "hi")
+            .chat_at_for_test(&ProviderHandle::default(), &url, "dead", None, None, "hi")
             .unwrap_err();
         assert!(err.to_string().contains("auth login claude"), "{err}");
     }

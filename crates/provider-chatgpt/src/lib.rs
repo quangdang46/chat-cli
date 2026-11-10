@@ -144,7 +144,7 @@ impl ChatGptProvider {
         conversation_url: &str,
     ) -> anyhow::Result<ChatResp> {
         let client = Self::http_client().context("failed to build HTTP client")?;
-        let device_id = protocol::device_id();
+        let device_id = protocol::device_id(&req.auth);
 
         // --- Sentinel: ask whether this turn needs a proof-of-work ---
         let requirements: crate::protocol::ChatRequirements = client
@@ -287,27 +287,68 @@ impl ChatGptProvider {
             }
             let status = v["message"]["status"].as_str().unwrap_or("");
             let author_role = v["message"]["author"]["role"].as_str().unwrap_or("");
-            if author_role != "assistant"
-                || !(status == "finished_successfully" || status.is_empty())
-            {
+            // Only a fully-finished assistant message counts. Partial
+            // statuses (and the previously-accepted empty status, which is
+            // what a truncated stream looks like) must not be persisted as
+            // the final answer.
+            if author_role != "assistant" || status != "finished_successfully" {
                 continue;
             }
-            if let Some(part) = v["message"]["content"]["parts"]
-                .as_array()
-                .and_then(|p| p.first())
-                .and_then(|p| p.as_str())
-            {
-                out.content = part.to_string();
+            if let Some(parts) = v["message"]["content"]["parts"].as_array() {
+                // Concat ALL text parts — taking only parts[0] silently
+                // dropped multi-part answers.
+                let text: String = parts.iter().filter_map(|p| p.as_str()).collect();
+                if text.is_empty() {
+                    continue;
+                }
+                out.content = text;
                 out.conversation_id = v["conversation_id"].as_str().map(String::from);
                 out.message_id = v["message"]["id"].as_str().map(String::from);
             }
         }
         if out.content.is_empty() && out.conversation_id.is_none() {
             bail!(
-                "no assistant response found in conversation stream — the account may be flagged or the model refused"
+                "no assistant response found in conversation stream — no message \
+                 reached finished_successfully (stream may be truncated), the \
+                 account may be flagged, or the model refused"
             );
         }
         Ok(out)
+    }
+
+    /// Chat flow with one forced token refresh on a mid-chat 401: the cached
+    /// access_token can be rejected before its recorded expiry, so a single
+    /// `GET /api/auth/session` refresh + retry is cheaper than failing the
+    /// whole turn.
+    fn chat_with_refresh(
+        handle: &ProviderHandle,
+        req: ChatReq,
+        session_url: &str,
+        requirements_url: &str,
+        conversation_url: &str,
+    ) -> anyhow::Result<ChatResp> {
+        let access_token = Self::ensure_fresh_access_token_at(&req.auth, session_url)?;
+        let auth = req.auth.clone();
+        match Self::chat_at(
+            handle,
+            req.clone(),
+            &access_token,
+            requirements_url,
+            conversation_url,
+        ) {
+            Err(e) if Self::is_unauthorized(&e) => {
+                let fresh = Self::refresh_access_token_at(&auth, session_url)?;
+                Self::chat_at(handle, req, &fresh, requirements_url, conversation_url)
+            }
+            other => other,
+        }
+    }
+
+    /// True when the error chain carries an HTTP 401 (sentinel or
+    /// conversation endpoint). Checks the whole anyhow chain because the
+    /// status may sit under a context layer.
+    fn is_unauthorized(e: &anyhow::Error) -> bool {
+        e.chain().any(|c| c.to_string().contains("401"))
     }
 }
 
@@ -336,11 +377,10 @@ impl Provider for ChatGptProvider {
     }
 
     fn chat(&self, handle: &ProviderHandle, req: ChatReq) -> anyhow::Result<ChatResp> {
-        let access_token = Self::ensure_fresh_access_token_at(&req.auth, SESSION_URL)?;
-        Self::chat_at(
+        Self::chat_with_refresh(
             handle,
             req,
-            &access_token,
+            SESSION_URL,
             SENTINEL_REQUIREMENTS_URL,
             CONVERSATION_URL,
         )
@@ -722,6 +762,82 @@ mod tests {
         assert!(msg.contains("auth login"), "must hint re-login: {msg}");
     }
 
+    /// Mid-chat 401: cached token is rejected → exactly one session refresh
+    /// → retry succeeds with the fresh token.
+    #[test]
+    fn chat_401_triggers_refresh_and_retry() {
+        let mut s = server();
+        let session = s
+            .mock("GET", "/api/auth/session")
+            .with_status(200)
+            .with_body(valid_session_body())
+            .expect(1)
+            .create();
+        s.mock("POST", "/sentinel/req")
+            .match_header("authorization", "Bearer stale-token")
+            .with_status(401)
+            .create();
+        s.mock("POST", "/sentinel/req")
+            .match_header("authorization", "Bearer access-token-xyz")
+            .with_status(200)
+            .with_body(requirements_body(false))
+            .create();
+        s.mock("POST", "/backend-api/conversation")
+            .match_header("authorization", "Bearer access-token-xyz")
+            .with_status(200)
+            .with_body(conversation_body())
+            .create();
+        let base = s.url();
+
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let mut req = chat_req();
+        req.auth = AuthContext {
+            session_token: Some("rolling-token".to_string()),
+            access_token: Some("stale-token".to_string()),
+            access_token_expiry: Some(future),
+            ..AuthContext::default()
+        };
+
+        let resp = ChatGptProvider::chat_with_refresh(
+            &ProviderHandle::default(),
+            req,
+            &format!("{base}/api/auth/session"),
+            &format!("{base}/sentinel/req"),
+            &format!("{base}/backend-api/conversation"),
+        )
+        .unwrap();
+
+        assert_eq!(resp.content, "hello there");
+        session.assert();
+    }
+
+    /// 401 whose refresh also fails must surface the re-login hint, not a
+    /// bare HTTP error.
+    #[test]
+    fn chat_401_with_dead_session_surfaces_relogin_hint() {
+        let mut s = server();
+        s.mock("GET", "/api/auth/session").with_status(401).create();
+        s.mock("POST", "/sentinel/req").with_status(401).create();
+        let base = s.url();
+
+        let mut req = chat_req();
+        req.auth = AuthContext {
+            session_token: Some("dead".to_string()),
+            ..AuthContext::default()
+        };
+
+        let err = ChatGptProvider::chat_with_refresh(
+            &ProviderHandle::default(),
+            req,
+            &format!("{base}/api/auth/session"),
+            &format!("{base}/sentinel/req"),
+            &format!("{base}/backend-api/conversation"),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("auth login chatgpt"), "{msg}");
+    }
+
     #[test]
     fn chat_maps_429_to_rate_limit_hint_with_deepseek_fallback() {
         let mut s = server();
@@ -752,6 +868,49 @@ mod tests {
         assert_eq!(parsed.content, "hello there");
         assert_eq!(parsed.conversation_id.as_deref(), Some("conv-9"));
         assert_eq!(parsed.message_id.as_deref(), Some("assistant-msg-7"));
+    }
+
+    /// A stream cut off mid-answer (assistant message never reaches
+    /// finished_successfully) must NOT be persisted as the final answer.
+    #[test]
+    fn parse_stream_rejects_truncated_in_progress_message() {
+        let body = format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "message": {
+                    "id": "assistant-msg-7",
+                    "author": {"role": "assistant"},
+                    "status": "in_progress",
+                    "content": {"content_type": "text", "parts": ["partial ans"]}
+                },
+                "conversation_id": "conv-9",
+            })
+        );
+        let err = ChatGptProvider
+            .parse_conversation_stream_for_test(&body)
+            .expect_err("truncated stream must fail");
+        assert!(err.to_string().contains("no assistant response"), "{err}");
+    }
+
+    /// Multi-part assistant messages concat ALL text parts (was: first only).
+    #[test]
+    fn parse_stream_concatenates_all_text_parts() {
+        let body = format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "message": {
+                    "id": "assistant-msg-7",
+                    "author": {"role": "assistant"},
+                    "status": "finished_successfully",
+                    "content": {"content_type": "text", "parts": ["part one ", "part two"]}
+                },
+                "conversation_id": "conv-9",
+            })
+        );
+        let parsed = ChatGptProvider
+            .parse_conversation_stream_for_test(&body)
+            .unwrap();
+        assert_eq!(parsed.content, "part one part two");
     }
 
     #[test]

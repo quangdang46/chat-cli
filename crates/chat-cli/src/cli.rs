@@ -88,10 +88,23 @@ pub enum Command {
 #[derive(Subcommand, Debug, Clone)]
 pub enum AuthCmd {
     /// Login to a provider (interactive or --token)
+    ///
+    /// NOTE: `--token VALUE` puts the secret in argv — visible in `ps`,
+    /// shell history, and process listings. Prefer omitting `--token` for the
+    /// interactive prompt, or pipe it: `printf '%s' "$TOK" | chat-cli auth
+    /// login <provider> --token-stdin` when scripting.
     Login {
         provider: String,
-        #[arg(long)]
+        /// Provider session token. WARNING: visible in shell history/`ps` —
+        /// omit for the interactive prompt when possible.
+        #[arg(long, conflicts_with = "token_stdin")]
         token: Option<String>,
+        /// Read the provider session token from stdin instead of argv or the
+        /// interactive prompt — keeps the secret out of shell history and
+        /// `ps` output. Example: `printf '%s' "$TOK" | chat-cli auth login
+        /// chatgpt --token-stdin`
+        #[arg(long = "token-stdin")]
+        token_stdin: bool,
         /// Set this provider as default_provider (overrides first-login-only)
         #[arg(long = "default")]
         set_default: bool,

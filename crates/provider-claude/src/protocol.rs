@@ -100,9 +100,25 @@ pub fn build_create_conversation(model: &str) -> Value {
 }
 
 /// The completion payload mirrors what the claude.ai web app sends. History
-/// context is baked into `prompt` by the dispatcher; `parent_message_uuid`
-/// stays the sentinel the web app uses for a fresh branch.
-pub fn build_completion_payload(prompt: &str, model: &str, attachments: Vec<Value>) -> Value {
+/// context is baked into `prompt` by the dispatcher.
+///
+/// `parent_message_uuid`: the web app parents each new message under the
+/// previous assistant message's uuid. We forward `parent_message_uuid` only
+/// when it is a real UUID (e.g. extracted from a previous stream); anything
+/// else — first turns, legacy `cl-<uuid>` history ids — falls back to the
+/// zero sentinel the web client itself sends for a fresh branch. (The
+/// reference claude2api gateway hardcodes the sentinel unconditionally; the
+/// completion SSE does not reliably expose message uuids, so this is
+/// best-effort.)
+pub fn build_completion_payload(
+    prompt: &str,
+    model: &str,
+    attachments: Vec<Value>,
+    parent_message_uuid: Option<&str>,
+) -> Value {
+    let parent = parent_message_uuid
+        .filter(|s| Uuid::parse_str(s).is_ok())
+        .unwrap_or("00000000-0000-4000-8000-000000000000");
     json!({
         "prompt": prompt,
         "model": model,
@@ -121,7 +137,7 @@ pub fn build_completion_payload(prompt: &str, model: &str, attachments: Vec<Valu
             {"type": "artifacts_v0", "name": "artifacts"},
             {"type": "repl_v0", "name": "repl"},
         ],
-        "parent_message_uuid": "00000000-0000-4000-8000-000000000000",
+        "parent_message_uuid": parent,
         "attachments": attachments,
         "files": [],
         "sync_sources": [],
@@ -130,9 +146,8 @@ pub fn build_completion_payload(prompt: &str, model: &str, attachments: Vec<Valu
     })
 }
 
-/// Extract the first organization uuid from `/api/account`.
-pub fn extract_org_uuid(account_json: &str) -> anyhow::Result<String> {
-    let v: Value = serde_json::from_str(account_json).context("invalid JSON from /api/account")?;
+/// Extract the first organization uuid from a parsed `/api/account` body.
+pub fn extract_org_uuid_value(v: &Value) -> anyhow::Result<String> {
     v["memberships"][0]["organization"]["uuid"]
         .as_str()
         .map(str::to_string)
@@ -141,6 +156,12 @@ pub fn extract_org_uuid(account_json: &str) -> anyhow::Result<String> {
                 "no organization in /api/account — the account may be unonboarded or restricted"
             )
         })
+}
+
+/// Extract the first organization uuid from `/api/account` JSON text.
+pub fn extract_org_uuid(account_json: &str) -> anyhow::Result<String> {
+    let v: Value = serde_json::from_str(account_json).context("invalid JSON from /api/account")?;
+    extract_org_uuid_value(&v)
 }
 
 /// Does this model name request extended thinking, and what is the base
@@ -162,31 +183,75 @@ pub fn text_attachment(text: &str) -> Value {
     })
 }
 
+/// Result of parsing a whole completion SSE body.
+#[derive(Debug, Clone, Default)]
+pub struct CompletionOutcome {
+    /// Folded assistant text (prose + `<think>` blocks + tool code fences).
+    pub text: String,
+    /// Best-effort uuid of the newest message seen in the stream — the
+    /// claude.ai completion SSE does not document a stable message-id field,
+    /// so this probes the common shapes (`message.uuid`, top-level `uuid`,
+    /// `message_id`, …) and keeps the LAST valid UUID (the assistant reply
+    /// trails the human echo). `None` when nothing uuid-shaped appears;
+    /// callers then fall back to a synthetic id and the zero
+    /// `parent_message_uuid` sentinel.
+    pub message_uuid: Option<String>,
+}
+
+/// First UUID-looking string at the plausible message-id paths of one SSE
+/// event, if any.
+fn event_message_uuid(ev: &Value) -> Option<String> {
+    let candidates = [
+        ev.pointer("/message/uuid"),
+        ev.pointer("/message/id"),
+        ev.get("uuid"),
+        ev.get("message_id"),
+        ev.pointer("/assistant_message_uuid"),
+    ];
+    for c in candidates.into_iter().flatten() {
+        if let Some(s) = c.as_str() {
+            if Uuid::parse_str(s).is_ok() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Parse a whole completion SSE body into the final assistant text.
 ///
-/// Stream shape (one JSON object per `data:` line): `text_delta` and
+/// Stream shape (one JSON object per `data:` line — the space after the
+/// colon is OPTIONAL and both forms occur): `text_delta` and
 /// `thinking_delta` carry prose/reasoning; `input_json_delta` fragments
 /// accumulate into the tool input JSON, whose `content` (+ optional
 /// `language`) is rendered as a fenced code block when the block stops.
 /// Thinking is wrapped in `<think>…</think>` like the reference gateway.
-pub fn parse_completion_sse(body: &str) -> anyhow::Result<String> {
+pub fn parse_completion_sse(body: &str) -> anyhow::Result<CompletionOutcome> {
     #[derive(Default)]
     struct StreamState {
         text: String,
         in_thinking: bool,
         tool_json: String,
+        message_uuid: Option<String>,
     }
 
     let mut state = StreamState::default();
     let emit = |state: &mut StreamState, s: &str| state.text.push_str(s);
 
     for line in body.lines() {
-        let Some(data) = line.strip_prefix("data: ") else {
+        // Accept both `data: {...}` and `data:{...}` — the reference parser
+        // required the trailing space and silently dropped bare `data:`.
+        let Some(data) = line.strip_prefix("data:") else {
             continue;
         };
+        let data = data.strip_prefix(' ').unwrap_or(data);
         let Ok(ev) = serde_json::from_str::<Value>(data) else {
             continue;
         };
+
+        if let Some(u) = event_message_uuid(&ev) {
+            state.message_uuid = Some(u);
+        }
 
         match ev["type"].as_str() {
             Some("error") => {
@@ -252,7 +317,10 @@ pub fn parse_completion_sse(body: &str) -> anyhow::Result<String> {
              the session may have expired, or usage limits may be hit"
         );
     }
-    Ok(state.text)
+    Ok(CompletionOutcome {
+        text: state.text,
+        message_uuid: state.message_uuid,
+    })
 }
 
 #[cfg(test)]
@@ -330,7 +398,12 @@ mod tests {
 
     #[test]
     fn completion_payload_mirrors_web_shape() {
-        let v = build_completion_payload("hi", "claude-sonnet-4-6", vec![text_attachment("ctx")]);
+        let v = build_completion_payload(
+            "hi",
+            "claude-sonnet-4-6",
+            vec![text_attachment("ctx")],
+            None,
+        );
         assert_eq!(v["prompt"], "hi");
         assert_eq!(v["model"], "claude-sonnet-4-6");
         assert_eq!(
@@ -371,7 +444,7 @@ mod tests {
             text_event("Hello "),
             text_event("world"),
         ]);
-        assert_eq!(parse_completion_sse(&body).unwrap(), "Hello world");
+        assert_eq!(parse_completion_sse(&body).unwrap().text, "Hello world");
     }
 
     #[test]
@@ -385,7 +458,7 @@ mod tests {
             text_event("answer"),
         ]);
         assert_eq!(
-            parse_completion_sse(&body).unwrap(),
+            parse_completion_sse(&body).unwrap().text,
             "<think> hmm ok</think>\nanswer"
         );
     }
@@ -401,7 +474,7 @@ mod tests {
             json!({"type": "content_block_stop"}),
             text_event("done"),
         ]);
-        let out = parse_completion_sse(&body).unwrap();
+        let out = parse_completion_sse(&body).unwrap().text;
         assert!(out.contains("running:"), "{out}");
         assert!(out.contains("\n```python\nprint(1)\n```\n"), "{out}");
         assert!(out.ends_with("done"), "{out}");
@@ -414,7 +487,10 @@ mod tests {
             json!({"type": "content_block_delta", "delta": {"type": "input_json_delta", "partial_json": "{\"language\": \"text/html\", \"content\": \"<p>hi</p>\"}"}}),
             json!({"type": "content_block_stop"}),
         ]);
-        assert!(parse_completion_sse(&body).unwrap().contains("```html\n"));
+        assert!(parse_completion_sse(&body)
+            .unwrap()
+            .text
+            .contains("```html\n"));
     }
 
     #[test]
@@ -437,6 +513,63 @@ mod tests {
             "data: not-json\n",
             "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n",
         );
-        assert_eq!(parse_completion_sse(body).unwrap(), "ok");
+        assert_eq!(parse_completion_sse(body).unwrap().text, "ok");
+    }
+
+    /// `data:` without the trailing space must parse identically — the old
+    /// parser required `"data: "` and silently dropped bare `data:` lines.
+    #[test]
+    fn sse_accepts_data_prefix_without_space() {
+        let body = concat!(
+            "data:{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"no-space \"}}\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"with-space\"}}\n",
+        );
+        assert_eq!(
+            parse_completion_sse(body).unwrap().text,
+            "no-space with-space"
+        );
+    }
+
+    /// A uuid carried anywhere in the stream is kept (last one wins) so the
+    /// next turn can parent under the real assistant message.
+    #[test]
+    fn sse_extracts_message_uuid_when_present() {
+        let human = "11111111-2222-4333-8444-555555555555";
+        let assistant = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let body = format!(
+            "data: {{\"type\":\"message_start\",\"message\":{{\"uuid\":\"{human}\"}}}}\n\
+             data: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"hi\"}}}}\n\
+             data: {{\"type\":\"message_stop\",\"uuid\":\"{assistant}\"}}\n"
+        );
+        let out = parse_completion_sse(&body).unwrap();
+        assert_eq!(out.text, "hi");
+        assert_eq!(out.message_uuid.as_deref(), Some(assistant));
+    }
+
+    #[test]
+    fn sse_without_uuid_yields_none() {
+        let body = sse(&[text_event("plain")]);
+        assert!(parse_completion_sse(&body).unwrap().message_uuid.is_none());
+    }
+
+    /// `parent_message_uuid` is forwarded only for real UUIDs; legacy
+    /// `cl-<uuid>` history ids and junk fall back to the zero sentinel.
+    #[test]
+    fn completion_payload_uses_real_parent_uuid_or_sentinel() {
+        let real = "123e4567-e89b-42d3-a456-426614174000";
+        let v = build_completion_payload("hi", "m", vec![], Some(real));
+        assert_eq!(v["parent_message_uuid"], real);
+
+        for bogus in [
+            Some("cl-123e4567-e89b-42d3-a456-426614174000"),
+            Some("not-a-uuid"),
+            None,
+        ] {
+            let v = build_completion_payload("hi", "m", vec![], bogus);
+            assert_eq!(
+                v["parent_message_uuid"], "00000000-0000-4000-8000-000000000000",
+                "bogus parent {bogus:?} must fall back to the sentinel"
+            );
+        }
     }
 }

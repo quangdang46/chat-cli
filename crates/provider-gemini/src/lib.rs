@@ -85,15 +85,19 @@ impl GeminiProvider {
         let model = match req.model.as_deref().map(protocol::resolve_static_model) {
             Some(Some(m)) => Some(*m),
             Some(None) => {
-                eprintln!(
-                    "note: unknown gemini model '{}' — using the account default (known: {})",
-                    req.model.as_deref().unwrap_or_default(),
-                    protocol::STATIC_MODELS
-                        .iter()
-                        .map(|m| m.name)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
+                // Only nag under --verbose: unknown models silently fall back
+                // to the account default otherwise.
+                if req.verbose {
+                    eprintln!(
+                        "note: unknown gemini model '{}' — using the account default (known: {})",
+                        req.model.as_deref().unwrap_or_default(),
+                        protocol::STATIC_MODELS
+                            .iter()
+                            .map(|m| m.name)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
                 None
             }
             None => None,

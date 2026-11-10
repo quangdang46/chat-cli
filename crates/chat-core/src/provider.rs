@@ -54,6 +54,14 @@ pub struct AuthContext {
     /// nothing to persist (e.g. tests).
     #[allow(clippy::type_complexity)]
     pub persist: Option<std::sync::Arc<dyn Fn(&str, &str) -> anyhow::Result<()> + Send + Sync>>,
+    /// Stable per-install device id (`[providers.<id>].device_id` in
+    /// config.toml). ChatGPT sends it as `Oai-Device-Id`; other providers
+    /// ignore it.
+    pub device_id: Option<String>,
+    /// Called once by a provider that generated a fresh device id so the
+    /// value is written back to config.toml and reused next run.
+    #[allow(clippy::type_complexity)]
+    pub persist_device_id: Option<std::sync::Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>>,
 }
 
 impl std::fmt::Debug for AuthContext {
@@ -63,6 +71,8 @@ impl std::fmt::Debug for AuthContext {
             .field("access_token", &self.access_token.as_ref().map(|_| "…"))
             .field("access_token_expiry", &self.access_token_expiry)
             .field("persist", &self.persist.is_some())
+            .field("device_id", &self.device_id.as_ref().map(|_| "…"))
+            .field("persist_device_id", &self.persist_device_id.is_some())
             .finish()
     }
 }
@@ -73,6 +83,15 @@ impl AuthContext {
     pub fn persist_access_token(&self, token: &str, expiry: &str) -> anyhow::Result<()> {
         match &self.persist {
             Some(save) => save(token, expiry),
+            None => Ok(()),
+        }
+    }
+
+    /// Persist a freshly generated device id via the dispatcher-provided
+    /// callback. Errors are returned; callers decide whether they are fatal.
+    pub fn save_device_id(&self, id: &str) -> anyhow::Result<()> {
+        match &self.persist_device_id {
+            Some(save) => save(id),
             None => Ok(()),
         }
     }

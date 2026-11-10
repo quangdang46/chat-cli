@@ -201,6 +201,11 @@ chat-cli auth status                        # logged-in providers + expiry
 chat-cli auth logout chatgpt
 ```
 
+> **Secret hygiene:** `--token <value>` places the session secret in argv —
+> visible in `ps`, shell history, and CI logs. Prefer the interactive prompt
+> (no flag), or pipe it so the value never touches argv:
+> `printf '%s' "$TOKEN" | chat-cli auth login chatgpt --token-stdin`.
+
 **Per-provider notes**
 
 - **claude** — same cookie-paste flow as ChatGPT: copy the `sessionKey` cookie

@@ -46,6 +46,11 @@ pub struct ProviderConfig {
     /// support ignore it; `--model` on the CLI overrides it for one turn.
     #[serde(default)]
     pub model: Option<String>,
+    /// Stable per-install device id persisted by providers that fingerprint
+    /// installs (currently ChatGPT's `Oai-Device-Id` header). Generated on
+    /// first use and reused thereafter.
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 impl Config {
