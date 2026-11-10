@@ -89,6 +89,15 @@ pub fn default_prepare_attachments(files: &[PathBuf]) -> anyhow::Result<String> 
     for path in files {
         let meta = fs::metadata(path)
             .map_err(|e| anyhow::anyhow!("cannot stat '{}': {}", path.display(), e))?;
+        // Reject anything that isn't a regular file: FIFOs, devices, sockets
+        // and directories report len 0 (or huge) and then block forever or
+        // spew garbage on read (-a /dev/zero hung indefinitely).
+        if !meta.is_file() {
+            anyhow::bail!(
+                "attachment '{}' is not a regular file (fifo/device/socket/dir are not supported)",
+                path.display()
+            );
+        }
         if meta.len() > MAX_FILE_BYTES {
             anyhow::bail!(
                 "file '{}' too large ({} bytes > {} limit)",
@@ -117,6 +126,12 @@ pub fn default_prepare_attachments(files: &[PathBuf]) -> anyhow::Result<String> 
 }
 
 /// If stdin is piped and no `-a` given, read stdin as an attachment.
+///
+/// The read is capped at `MAX_TOTAL_BYTES + 1` via `Read::take` so an
+/// unbounded/held-open pipe (`yes | chat-cli`, agent harnesses) can't exhaust
+/// memory — oversize input is rejected after the bounded read. Callers in
+/// async contexts should wrap this in `spawn_blocking` (it performs blocking
+/// I/O).
 pub fn maybe_read_stdin_as_attachment(has_attachments: bool) -> anyhow::Result<String> {
     if has_attachments {
         return Ok(String::new());
@@ -127,7 +142,17 @@ pub fn maybe_read_stdin_as_attachment(has_attachments: bool) -> anyhow::Result<S
     }
     let mut buf = String::new();
     use std::io::Read;
-    std::io::stdin().read_to_string(&mut buf)?;
+    // +1 byte so "exactly at the limit" and "over the limit" are
+    // distinguishable after the read.
+    std::io::stdin()
+        .take(MAX_TOTAL_BYTES + 1)
+        .read_to_string(&mut buf)?;
+    if buf.len() as u64 > MAX_TOTAL_BYTES {
+        anyhow::bail!(
+            "stdin too large (>{} bytes limit) — pipe output was truncated at the cap",
+            MAX_TOTAL_BYTES
+        );
+    }
     build_stdin_attachment(buf)
 }
 
@@ -338,6 +363,25 @@ mod tests {
 
         let err = default_prepare_attachments(&files).unwrap_err();
         assert!(err.to_string().contains("total attachments too large"));
+    }
+
+    #[test]
+    fn directory_attachment_is_rejected_as_non_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory has metadata but is not a regular file — must bail
+        // before any read attempt (previously read_to_string would fail or
+        // block depending on platform).
+        let err = default_prepare_attachments(&[dir.path().to_path_buf()]).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn device_attachment_is_rejected_fast() {
+        // /dev/zero is an infinite source — the is_file() guard must reject
+        // it before read_to_string can block forever.
+        let err = default_prepare_attachments(&[PathBuf::from("/dev/zero")]).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 
     #[test]
