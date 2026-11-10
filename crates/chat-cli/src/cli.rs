@@ -57,8 +57,15 @@ pub struct Args {
     #[arg(long = "new", conflicts_with = "continue_id")]
     pub new: bool,
 
-    /// Continue conversation (optionally by id)
-    #[arg(long = "continue", value_name = "ID", num_args = 0..=1, default_missing_value = "")]
+    /// Continue conversation (optionally by id; use --continue=<id> — a
+    /// space-separated value would be parsed as the positional prompt)
+    #[arg(
+        long = "continue",
+        value_name = "ID",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = ""
+    )]
     pub continue_id: Option<String>,
 }
 
@@ -169,8 +176,18 @@ mod tests {
         let args = parse(&["--continue", "-p", "x"]);
         assert_eq!(args.continue_id.as_deref(), Some(""));
 
-        let args = parse(&["--continue", "explicit-id", "-p", "x"]);
+        let args = parse(&["--continue=explicit-id", "-p", "x"]);
         assert_eq!(args.continue_id.as_deref(), Some("explicit-id"));
+    }
+
+    #[test]
+    fn continue_space_separated_value_is_positional_prompt_not_id() {
+        // Regression: `--continue "hi"` used to swallow "hi" as the
+        // conversation id, leaving no prompt. require_equals fixes it.
+        let args = parse(&["--continue", "hi there"]);
+        assert_eq!(args.continue_id.as_deref(), Some(""));
+        assert_eq!(args.prompt_positional.as_deref(), Some("hi there"));
+        assert_eq!(args.effective_prompt(), Some("hi there"));
     }
 
     #[test]

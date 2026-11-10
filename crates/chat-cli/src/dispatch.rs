@@ -9,10 +9,16 @@ use chat_core::history::HistoryFile;
 
 use crate::cli::{Args, AuthCmd, Command, ConfigCmd, HistoryCmd};
 
-pub async fn run(args: Args) -> anyhow::Result<()> {
+pub async fn run(mut args: Args) -> anyhow::Result<()> {
     // Subcommands
-    if let Some(cmd) = args.command.clone() {
+    if let Some(cmd) = args.command.take() {
         return run_subcommand(cmd, &args).await;
+    }
+
+    // -p wins over the positional alias; say so on stderr instead of
+    // silently dropping the positional (stdout stays clean for piping).
+    if args.prompt.is_some() && args.prompt_positional.is_some() {
+        eprintln!("[info] both -p/--prompt and a positional prompt were given; using -p");
     }
 
     // Chat mode: must have a prompt
@@ -43,17 +49,25 @@ async fn run_subcommand(cmd: Command, global: &Args) -> anyhow::Result<()> {
             }
             AuthCmd::Status => {
                 let cfg = Config::load(config_path)?;
-                println!("default_provider: {:?}", cfg.default_provider);
+                match cfg.default_provider.as_deref() {
+                    Some(p) => println!("default_provider: {p}"),
+                    None => println!("default_provider: (unset)"),
+                }
                 for (k, v) in &cfg.providers {
                     let has_token = v.session_token.is_some();
                     println!(
-                        "  {}: logged_in={} expiry={:?}",
-                        k, has_token, v.access_token_expiry
+                        "  {}: logged_in={} expiry={}",
+                        k,
+                        has_token,
+                        v.access_token_expiry.as_deref().unwrap_or("(none)")
                     );
                 }
                 Ok(())
             }
             AuthCmd::Logout { provider } => {
+                // Same validation as `auth default`/`config set` — a typo'd
+                // provider must not "succeed" silently.
+                ensure_known_provider(&provider)?;
                 let mut cfg = Config::load(config_path)?;
                 cfg.providers.remove(&provider);
                 // If default_provider was this one, clear it
@@ -68,11 +82,17 @@ async fn run_subcommand(cmd: Command, global: &Args) -> anyhow::Result<()> {
         Command::History { cmd } => {
             match cmd {
                 HistoryCmd::List { provider, limit } => {
+                    // Same validation as everywhere else — a bogus provider
+                    // must error, not silently print an empty list.
+                    if let Some(p) = &provider {
+                        ensure_known_provider(p)?;
+                    }
                     let mut items = HistoryFile::list(None)?;
                     if let Some(p) = provider {
                         items.retain(|h| h.provider == p);
                     }
-                    if let Some(n) = limit {
+                    // `--limit 0` means "no limit" (show everything).
+                    if let Some(n) = limit.filter(|&n| n > 0) {
                         items.truncate(n);
                     }
                     for h in items {
@@ -89,15 +109,9 @@ async fn run_subcommand(cmd: Command, global: &Args) -> anyhow::Result<()> {
                     Ok(())
                 }
                 HistoryCmd::Rm { id } => {
-                    let path = HistoryFile::history_dir(None).join(format!("{}.jsonl", id));
-                    // Map missing dir/file to a clean message instead of a raw OS
-                    // error (fixes #4: Windows reports os error 3 for the absent
-                    // history dir, which read like a crash).
-                    if !path.exists() {
-                        anyhow::bail!("history entry '{id}' not found (run 'chat-cli history list' to see ids)");
-                    }
-                    std::fs::remove_file(&path)
-                        .with_context(|| format!("failed to remove history entry '{id}'"))?;
+                    // HistoryFile::rm validates the id (path-traversal safe)
+                    // and reports a friendly not-found.
+                    HistoryFile::rm(&id, None)?;
                     println!("removed {}", id);
                     Ok(())
                 }
@@ -123,7 +137,10 @@ async fn run_subcommand(cmd: Command, global: &Args) -> anyhow::Result<()> {
             ConfigCmd::Get { key } => {
                 let cfg = Config::load(config_path)?;
                 match key.as_str() {
-                    "default_provider" => println!("{:?}", cfg.default_provider),
+                    "default_provider" => match cfg.default_provider.as_deref() {
+                        Some(p) => println!("{p}"),
+                        None => println!("(unset)"),
+                    },
                     _ => anyhow::bail!(
                         "unknown config key '{}' (only 'default_provider' supported)",
                         key
@@ -148,14 +165,22 @@ fn ensure_known_provider(provider_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load a history entry with a clean "not found" message instead of a raw
-/// filesystem error (#4).
+/// Load a history entry by id with two layers of protection:
+/// - the id is validated against the nanoid alphabet before any path join
+///   (path-traversal fix — `../x`, `a/b`, absolute paths are rejected);
+/// - a missing entry produces a clean "not found" message (naming the
+///   `<id>.jsonl` file) instead of a raw OS error.
 fn load_history_or_not_found(id: &str) -> anyhow::Result<HistoryFile> {
-    let path = HistoryFile::history_dir(None).join(format!("{}.jsonl", id));
+    let path = HistoryFile::path_for_id(id, None)?;
     if !path.exists() {
         anyhow::bail!("history entry '{id}' not found (run 'chat-cli history list' to see ids)");
     }
-    HistoryFile::load(id, None)
+    HistoryFile::load(id, None).with_context(|| {
+        format!(
+            "failed to parse history file '{}'; it may be corrupt",
+            path.display()
+        )
+    })
 }
 
 /// `auth login <provider> [--token ...] [--default]`: print copy-paste
@@ -182,11 +207,21 @@ async fn auth_login(
     let token = match token {
         Some(t) => t,
         None => {
+            // Non-TTY (piped stdin, CI, agent harness): rpassword would block
+            // or consume the pipe — fail fast and tell the user to pass
+            // --token explicitly.
+            use std::io::IsTerminal;
+            if !std::io::stdin().is_terminal() {
+                anyhow::bail!(
+                    "no --token given and stdin is not a TTY — rerun with \
+                     'chat-cli auth login {provider_id} --token <token>'"
+                );
+            }
             eprint!("Paste session token for {provider_id}: ");
             use std::io::Write;
             std::io::stderr().flush()?;
             rpassword::read_password()
-                .context("failed reading token from terminal (no TTY?); pass --token instead")?
+                .context("failed reading token from terminal; pass --token instead")?
         }
     };
     // Oversized ChatGPT JWTs are chunked by the browser into
@@ -327,20 +362,30 @@ async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
         provider.context_limit()
     );
 
-    // 2. Attach
+    // 2. Attach. The stdin read is blocking I/O — keep it off the tokio
+    // worker via spawn_blocking (the read itself is byte-capped inside).
     let files = chat_core::attach::resolve_attachments(&args.attach)?;
     let attachments_text = provider.prepare_attachments(&files)?;
-    let stdin_text = chat_core::attach::maybe_read_stdin_as_attachment(!files.is_empty())?;
+    let file_count = files.len();
+    let has_files = !files.is_empty();
+    let stdin_text = tokio::task::spawn_blocking(move || {
+        chat_core::attach::maybe_read_stdin_as_attachment(has_files)
+    })
+    .await
+    .context("stdin attachment task panicked")??;
     let attachments_text = format!("{}{}", attachments_text, stdin_text);
     vlog!(
         "attachments: {} file(s), {} chars (stdin: {})",
-        files.len(),
+        file_count,
         attachments_text.len(),
         !stdin_text.is_empty()
     );
 
-    // 3. History
-    let (handle, history_text) = resolve_history(&args, &provider_id)?;
+    // 3. History. Providers that continue server-side via ProviderHandle ids
+    // already carry prior turns — only providers without server-side memory
+    // get the transcript replayed into the prompt (double-replay fix).
+    let replay_text = provider.replays_history_text();
+    let (handle, history_text) = resolve_history(&args, &provider_id, replay_text)?;
     vlog!(
         "history: conversation_id={:?} parent_message_id={:?} context_chars={}",
         handle.conversation_id,
@@ -421,9 +466,13 @@ async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve the continuation handle + optional history transcript.
+/// `replay_text` is the provider's `replays_history_text()` capability — when
+/// false the transcript is NOT built (server-side continuation carries it).
 fn resolve_history(
     args: &Args,
     provider_id: &str,
+    replay_text: bool,
 ) -> anyhow::Result<(chat_core::provider::ProviderHandle, String)> {
     use chat_core::provider::ProviderHandle;
 
@@ -438,23 +487,33 @@ fn resolve_history(
             let mut items = HistoryFile::list(None)?;
             items.retain(|h| h.provider == provider_id);
             if let Some(item) = items.into_iter().next() {
-                let hf = HistoryFile::load(&item.id, None)?;
+                let hf = load_history_or_not_found(&item.id)?;
                 let handle = ProviderHandle {
                     conversation_id: hf.provider_conversation_id.clone(),
                     parent_message_id: hf.provider_parent_message_id.clone(),
                 };
-                let text = hf.to_context_text();
+                let text = if replay_text {
+                    hf.to_context_text()
+                } else {
+                    String::new()
+                };
                 return Ok((handle, text));
             }
             return Ok((ProviderHandle::default(), String::new()));
         } else {
-            let hf = HistoryFile::load(cid, None)?;
+            // Friendly not-found + id validation (traversal-safe) — same path
+            // as `history show`, so --continue <bogus> no longer leaks OS errors.
+            let hf = load_history_or_not_found(cid)?;
             chat_core::history::validate_continue_provider(&hf, provider_id)?;
             let handle = ProviderHandle {
                 conversation_id: hf.provider_conversation_id.clone(),
                 parent_message_id: hf.provider_parent_message_id.clone(),
             };
-            let text = hf.to_context_text();
+            let text = if replay_text {
+                hf.to_context_text()
+            } else {
+                String::new()
+            };
             return Ok((handle, text));
         }
     }
@@ -463,12 +522,16 @@ fn resolve_history(
     let mut items = HistoryFile::list(None)?;
     items.retain(|h| h.provider == provider_id);
     if let Some(item) = items.into_iter().next() {
-        let hf = HistoryFile::load(&item.id, None)?;
+        let hf = load_history_or_not_found(&item.id)?;
         let handle = ProviderHandle {
             conversation_id: hf.provider_conversation_id.clone(),
             parent_message_id: hf.provider_parent_message_id.clone(),
         };
-        let text = hf.to_context_text();
+        let text = if replay_text {
+            hf.to_context_text()
+        } else {
+            String::new()
+        };
         return Ok((handle, text));
     }
     Ok((ProviderHandle::default(), String::new()))
@@ -496,7 +559,9 @@ fn persist_history(
                 HistoryFile::new(provider_id)
             }
         } else {
-            HistoryFile::load(cid, None)?
+            // Friendly not-found + traversal-safe id validation, same as
+            // resolve_history — a bogus --continue=<id> must not leak OS errors.
+            load_history_or_not_found(cid)?
         }
     } else {
         // default continue most recent
@@ -550,6 +615,12 @@ mod tests {
             100_000
         }
 
+        // Test provider has no server-side memory — it relies on the
+        // dispatcher replaying the transcript, like a text-only backend.
+        fn replays_history_text(&self) -> bool {
+            true
+        }
+
         fn auth(&self, token: &str) -> anyhow::Result<chat_core::provider::Session> {
             if self.fail_auth {
                 return Ok(chat_core::provider::Session {
@@ -583,6 +654,61 @@ mod tests {
                 message_id: "tm-1".into(),
             })
         }
+    }
+
+    /// Provider that continues server-side (like the real web providers):
+    /// `replays_history_text()` is false, so the dispatcher must NOT prepend
+    /// the transcript — the handle ids carry the context.
+    struct ServerSideProvider;
+
+    impl chat_core::provider::Provider for ServerSideProvider {
+        fn id(&self) -> &'static str {
+            "serverprov"
+        }
+
+        fn context_limit(&self) -> usize {
+            100_000
+        }
+
+        fn replays_history_text(&self) -> bool {
+            false
+        }
+
+        fn auth(&self, _token: &str) -> anyhow::Result<chat_core::provider::Session> {
+            Ok(chat_core::provider::Session {
+                valid: true,
+                expiry: None,
+            })
+        }
+
+        fn chat(
+            &self,
+            handle: &chat_core::provider::ProviderHandle,
+            req: chat_core::provider::ChatReq,
+        ) -> anyhow::Result<chat_core::provider::ChatResp> {
+            test_calls().lock().push(format!(
+                "prompt={} conv={:?} parent={:?}",
+                req.prompt, handle.conversation_id, handle.parent_message_id
+            ));
+            Ok(chat_core::provider::ChatResp {
+                content: "ok".into(),
+                conversation_id: "sc-1".into(),
+                message_id: "sm-1".into(),
+            })
+        }
+    }
+
+    static REGISTERED_SERVER: LazyLock<()> = LazyLock::new(|| {
+        inventory::submit! {
+            chat_core::provider::ProviderEntry {
+                id: "serverprov",
+                factory: || Box::new(ServerSideProvider),
+            }
+        }
+    });
+
+    fn ensure_server_registered() {
+        LazyLock::force(&REGISTERED_SERVER);
     }
 
     static REGISTERED: LazyLock<Arc<Mutex<Vec<String>>>> = LazyLock::new(|| {
@@ -865,7 +991,9 @@ mod tests {
 
         let items = HistoryFile::list(None).unwrap();
         let hid = &items[0].id;
-        let args = parse(&["--provider", "deepseek", "--continue", hid, "-p", "hi"]);
+        // --continue=<id> form: space-separated values are now positional prompts.
+        let cont = format!("--continue={hid}");
+        let args = parse(&["--provider", "deepseek", &cont, "-p", "hi"]);
         let err = run(args).await.unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -902,9 +1030,8 @@ mod tests {
         let hid = items[0].id.clone();
         test_calls().lock().clear();
 
-        run(parse(&["--continue", &hid, "-p", "branch"]))
-            .await
-            .unwrap();
+        let cont = format!("--continue={hid}");
+        run(parse(&[&cont, "-p", "branch"])).await.unwrap();
         let calls_arc = test_calls();
         let calls = calls_arc.lock();
         assert!(
@@ -952,5 +1079,148 @@ mod tests {
         run(parse(&["history", "list", "--limit", "5"]))
             .await
             .unwrap();
+    }
+
+    // --- bead chat-cli-continue-and-auth-ux-038 regressions ---
+
+    #[tokio::test]
+    async fn continue_bogus_id_is_friendly_not_found() {
+        test_calls();
+        let _env = temp_env();
+        run(parse(&["auth", "login", "testprov", "--token", "s"]))
+            .await
+            .unwrap();
+        let err = run(parse(&["--continue=bogus0000", "-p", "hi"]))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not found"), "friendly error expected: {msg}");
+        assert!(
+            !msg.contains("os error"),
+            "raw OS error must not leak: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_traversal_id_is_rejected() {
+        test_calls();
+        let _env = temp_env();
+        run(parse(&["auth", "login", "testprov", "--token", "s"]))
+            .await
+            .unwrap();
+        // --continue=<id> form (require_equals): hostile ids must be rejected
+        // before any filesystem path is built.
+        for bad in ["../victim", "a/b", "..\\win", ".."] {
+            let arg = format!("--continue={bad}");
+            let err = run(parse(&[&arg, "-p", "hi"])).await.unwrap_err();
+            assert!(
+                err.to_string().contains("invalid history id"),
+                "{bad:?} must be rejected: {err}"
+            );
+        }
+        // And the shared loader rejects them too (covers history show path).
+        assert!(load_history_or_not_found("../victim").is_err());
+        assert!(load_history_or_not_found("a/b").is_err());
+        assert!(load_history_or_not_found("..").is_err());
+    }
+
+    #[tokio::test]
+    async fn auth_logout_unknown_provider_is_error() {
+        test_calls();
+        let _env = temp_env();
+        let err = run(parse(&["auth", "logout", "no-such-provider"]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown provider"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn auth_login_without_token_on_non_tty_fails_fast() {
+        test_calls();
+        let _env = temp_env();
+        // cargo test stdin is not a TTY — must bail before prompting.
+        let err = run(parse(&["auth", "login", "testprov"]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("--token"), "{err}");
+        assert!(
+            !Config::load(None)
+                .unwrap()
+                .providers
+                .contains_key("testprov"),
+            "failed login must not persist"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_list_unknown_provider_is_error() {
+        test_calls();
+        let _env = temp_env();
+        let err = run(parse(&["history", "list", "--provider", "bogusprov"]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown provider"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn history_rm_traversal_id_is_rejected() {
+        test_calls();
+        let _env = temp_env();
+        let err = run(parse(&["history", "rm", "../victim"]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid history id"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn server_side_provider_does_not_get_history_text_replay() {
+        test_calls();
+        ensure_server_registered();
+        let _env = temp_env();
+        clear_history_dir();
+        run(parse(&["auth", "login", "serverprov", "--token", "s"]))
+            .await
+            .unwrap();
+        run(parse(&[
+            "--provider",
+            "serverprov",
+            "--new",
+            "-p",
+            "first turn",
+        ]))
+        .await
+        .unwrap();
+        test_calls().lock().clear();
+        run(parse(&[
+            "--provider",
+            "serverprov",
+            "--continue",
+            "-p",
+            "second turn",
+        ]))
+        .await
+        .unwrap();
+
+        let calls = test_calls();
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 1);
+        // Server-side continuation: prompt is ONLY the new turn — no
+        // "user:/assistant:" transcript replay — while the stored ids flow.
+        assert!(
+            calls[0].starts_with("prompt=second turn "),
+            "no history text may be prepended: {}",
+            calls[0]
+        );
+        assert!(
+            !calls[0].contains("user:"),
+            "transcript replay leaked into prompt: {}",
+            calls[0]
+        );
+        assert!(
+            calls[0].contains("conv=Some(\"sc-1\")"),
+            "server-side ids must still flow: {}",
+            calls[0]
+        );
+        clear_history_dir();
     }
 }
