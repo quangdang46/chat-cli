@@ -4,8 +4,10 @@
 //! with `role = "__meta__"`.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -58,17 +60,47 @@ impl HistoryFile {
             .join("history")
     }
 
-    pub fn history_path(&self, override_dir: Option<&Path>) -> PathBuf {
-        Self::history_dir(override_dir).join(format!("{}.jsonl", self.id))
+    pub fn history_path(&self, override_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
+        Self::path_for_id(&self.id, override_dir)
+    }
+
+    /// Resolve `<history_dir>/<id>.jsonl` after validating the id.
+    ///
+    /// Ids are local nanoids; anything outside `[A-Za-z0-9_-]` is rejected so
+    /// `load`/`rm`/`--continue` can never escape the history directory via
+    /// `../` or absolute-path tricks (path-traversal fix).
+    pub fn path_for_id(id: &str, override_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
+        validate_history_id(id)?;
+        Ok(Self::history_dir(override_dir).join(format!("{id}.jsonl")))
+    }
+
+    /// Delete `<id>.jsonl` from the history dir. Validates the id first;
+    /// missing entries produce a friendly "not found" instead of a raw OS error.
+    pub fn rm(id: &str, override_dir: Option<&Path>) -> anyhow::Result<()> {
+        let path = Self::path_for_id(id, override_dir)?;
+        if !path.exists() {
+            anyhow::bail!(
+                "history entry '{id}' not found (run 'chat-cli history list' to see ids)"
+            );
+        }
+        fs::remove_file(&path)
+            .with_context(|| format!("failed to remove history file '{}'", path.display()))?;
+        Ok(())
     }
 
     pub fn save(&self, override_dir: Option<&Path>) -> anyhow::Result<()> {
-        let path = self.history_path(override_dir);
+        let path = self.history_path(override_dir)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let mut out = String::new();
-        // First line: meta
+        // First line: meta. `turn_count`/`preview` are duplicated here so
+        // `list()` can summarize from the first line alone (no full-file scan).
+        let preview = self
+            .turns
+            .last()
+            .map(|t| truncate(&t.content, 80))
+            .unwrap_or_default();
         let meta = serde_json::json!({
             "role": "__meta__",
             "id": self.id,
@@ -76,6 +108,8 @@ impl HistoryFile {
             "provider_conversation_id": self.provider_conversation_id,
             "provider_parent_message_id": self.provider_parent_message_id,
             "created_at": self.created_at,
+            "turn_count": self.turns.len(),
+            "preview": preview,
         });
         out.push_str(&serde_json::to_string(&meta)?);
         out.push('\n');
@@ -83,13 +117,24 @@ impl HistoryFile {
             out.push_str(&serde_json::to_string(t)?);
             out.push('\n');
         }
-        fs::write(&path, out)?;
+        // Atomic write (tmp + rename) with 0600 perms — same scheme as
+        // Config::save; history holds conversation content and must survive
+        // crashes without corruption or partial writes.
+        let tmp = path.with_extension("jsonl.tmp");
+        fs::write(&tmp, out)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+        }
+        fs::rename(&tmp, &path)?;
         Ok(())
     }
 
     pub fn load(id: &str, override_dir: Option<&Path>) -> anyhow::Result<Self> {
-        let path = Self::history_dir(override_dir).join(format!("{}.jsonl", id));
-        let content = fs::read_to_string(&path)?;
+        let path = Self::path_for_id(id, override_dir)?;
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read history file '{}'", path.display()))?;
         Self::from_jsonl(&content)
     }
 
@@ -139,6 +184,15 @@ impl HistoryFile {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
+            // Fast path: `save` duplicates turn_count/preview into the __meta__
+            // first line, so a summary needs only that line — not a full
+            // parse of every turn in every file.
+            if let Some(summary) = Self::summary_from_meta_line(&path) {
+                out.push(summary);
+                continue;
+            }
+            // Fallback for legacy files written before the meta summary
+            // fields existed: full parse.
             let content = match fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(_) => continue,
@@ -162,10 +216,55 @@ impl HistoryFile {
         Ok(out)
     }
 
-    /// Text to inject for `--continue` (all turns concatenated).
+    /// Build a `HistorySummary` from only the first (`__meta__`) line of a
+    /// history file. Returns `None` for legacy files whose meta line lacks
+    /// the `turn_count`/`preview` summary fields.
+    fn summary_from_meta_line(path: &Path) -> Option<HistorySummary> {
+        let file = fs::File::open(path).ok()?;
+        // Meta lines are small; cap the read so a corrupt giant first line
+        // can't make `history list` swallow unbounded memory.
+        let mut reader = BufReader::new(file.take(MAX_META_LINE_BYTES));
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        let meta: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+        if meta.get("role").and_then(|v| v.as_str()) != Some("__meta__") {
+            return None;
+        }
+        let turn_count = meta.get("turn_count")?.as_u64()? as usize;
+        let preview = meta.get("preview")?.as_str()?.to_string();
+        Some(HistorySummary {
+            id: meta.get("id")?.as_str()?.to_string(),
+            provider: meta.get("provider")?.as_str()?.to_string(),
+            created_at: meta.get("created_at")?.as_str()?.to_string(),
+            turn_count,
+            preview,
+        })
+    }
+
+    /// Text to inject for `--continue` (all turns concatenated), capped to
+    /// the most recent turns that fit `MAX_CONTEXT_TEXT_CHARS` — replaying an
+    /// unbounded history can exceed the provider's context window.
     pub fn to_context_text(&self) -> String {
+        // Walk newest→oldest, keeping turns until the char budget is spent.
+        let mut kept: Vec<&Turn> = Vec::new();
+        let mut used = 0usize;
+        for t in self.turns.iter().rev() {
+            let cost = t.role.len() + t.content.len() + 4; // "role: \n" overhead
+            if !kept.is_empty() && used + cost > MAX_CONTEXT_TEXT_CHARS {
+                break;
+            }
+            used += cost;
+            kept.push(t);
+        }
+        kept.reverse();
+        let omitted = self.turns.len() - kept.len();
         let mut s = String::new();
-        for t in &self.turns {
+        if omitted > 0 {
+            s.push_str(&format!("[... {omitted} earlier turns omitted ...]\n"));
+        }
+        for t in kept {
             s.push_str(&format!("{}: {}\n", t.role, t.content));
         }
         s
@@ -181,9 +280,39 @@ pub struct HistorySummary {
     pub preview: String,
 }
 
+/// Char budget for `to_context_text` replay (roughly the text volume that
+/// fits a typical provider context window with headroom for the new prompt).
+pub const MAX_CONTEXT_TEXT_CHARS: usize = 100_000;
+
+/// Upper bound on bytes read for the `__meta__` line during `list`.
+const MAX_META_LINE_BYTES: u64 = 1 << 20; // 1 MiB
+
+/// History ids are nanoid-style tokens; anything outside this alphabet is
+/// rejected before it can be joined into a filesystem path.
+const MAX_ID_LEN: usize = 64;
+
 fn nanoid() -> String {
-    // 8-char nanoid for local history id (short, readable)
-    Uuid::new_v4().to_string()[..8].to_string()
+    // 12-char id (8 hex + '-' + 3 hex from the UUID prefix): ~48 bits of
+    // entropy — the old 8-char ids (32 bits) collided around ~65k histories.
+    Uuid::new_v4().to_string()[..12].to_string()
+}
+
+/// Validate a user-supplied history id (`history show/rm`, `--continue <id>`).
+/// Rejects path separators, `..`, and anything outside the nanoid alphabet so
+/// ids can never escape the history directory.
+pub fn validate_history_id(id: &str) -> anyhow::Result<()> {
+    let ok = !id.is_empty()
+        && id.len() <= MAX_ID_LEN
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !ok {
+        anyhow::bail!(
+            "invalid history id '{id}' — expected 1-{MAX_ID_LEN} chars of [A-Za-z0-9_-] \
+             (run 'chat-cli history list' to see valid ids)"
+        );
+    }
+    Ok(())
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -239,9 +368,9 @@ mod tests {
     }
 
     #[test]
-    fn new_history_has_8_char_id_and_no_provider_ids() {
+    fn new_history_has_12_char_id_and_no_provider_ids() {
         let hf = HistoryFile::new("chatgpt");
-        assert_eq!(hf.id.len(), 8, "local history id must be an 8-char nanoid");
+        assert_eq!(hf.id.len(), 12, "local history id must be a 12-char nanoid");
         assert!(hf.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
         assert_eq!(hf.provider, "chatgpt");
         assert!(hf.provider_conversation_id.is_none());
@@ -305,6 +434,160 @@ mod tests {
     fn load_missing_id_errors() {
         let dir = tempfile::tempdir().unwrap();
         assert!(HistoryFile::load("nope0000", Some(dir.path())).is_err());
+    }
+
+    // --- path traversal regression (bead chat-cli-history-id-path-traversal-e5p) ---
+
+    #[test]
+    fn validate_history_id_accepts_nanoid_alphabet() {
+        for id in ["abcd1234", "a-b_c-9", &"x".repeat(64)] {
+            assert!(validate_history_id(id).is_ok(), "{id} must be accepted");
+        }
+    }
+
+    #[test]
+    fn validate_history_id_rejects_traversal_and_separators() {
+        for id in [
+            "..",
+            "../victim",
+            "..\\victim",
+            "a/b",
+            "a\\b",
+            "/etc/passwd",
+            "C:\\x",
+            "",
+            "has space",
+            "dot.name",
+            &"x".repeat(65),
+        ] {
+            let err = validate_history_id(id).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid history id"),
+                "{id:?} must be rejected: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_rejects_traversal_id_before_touching_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        // A real file outside the history dir that a traversal id would hit.
+        let victim = dir.path().join("victim.jsonl");
+        std::fs::write(&victim, "{\"role\":\"__meta__\"}\n").unwrap();
+        let history_dir = dir.path().join("history");
+        std::fs::create_dir_all(&history_dir).unwrap();
+
+        for bad in ["../victim", "..\\victim", "../../etc/passwd"] {
+            assert!(
+                HistoryFile::load(bad, Some(&history_dir)).is_err(),
+                "load({bad:?}) must be rejected"
+            );
+        }
+        // The victim file must be untouched.
+        assert!(victim.exists());
+    }
+
+    #[test]
+    fn rm_rejects_traversal_and_never_deletes_outside_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.jsonl");
+        std::fs::write(&victim, "data").unwrap();
+        let history_dir = dir.path().join("history");
+        std::fs::create_dir_all(&history_dir).unwrap();
+
+        for bad in ["../victim", "..\\victim"] {
+            assert!(HistoryFile::rm(bad, Some(&history_dir)).is_err());
+        }
+        assert!(
+            victim.exists(),
+            "traversal rm must not delete outside files"
+        );
+    }
+
+    #[test]
+    fn save_rejects_hostile_id_instead_of_writing_outside_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let history_dir = dir.path().join("history");
+        std::fs::create_dir_all(&history_dir).unwrap();
+        let mut hf = sample_history("../escape", "chatgpt", "2026-08-21T10:00:00+00:00");
+        hf.id = "../escape".to_string();
+        assert!(hf.save(Some(&history_dir)).is_err());
+        assert!(!dir.path().join("escape.jsonl").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_history_file_has_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        sample_history("perm00001", "chatgpt", "2026-08-21T10:00:00+00:00")
+            .save(Some(dir.path()))
+            .unwrap();
+        let mode = std::fs::metadata(dir.path().join("perm00001.jsonl"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "history holds conversation content");
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_tmp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        sample_history("atom00001", "chatgpt", "2026-08-21T10:00:00+00:00")
+            .save(Some(dir.path()))
+            .unwrap();
+        assert!(dir.path().join("atom00001.jsonl").exists());
+        assert!(
+            !dir.path().join("atom00001.jsonl.tmp").exists(),
+            "atomic rename must consume the temp file"
+        );
+    }
+
+    #[test]
+    fn list_reads_meta_line_summary_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hf = sample_history("meta0002", "chatgpt", "2026-08-21T10:00:00+00:00");
+        hf.turns.push(turn("user", "extra turn"));
+        hf.save(Some(dir.path())).unwrap();
+
+        // Meta line must carry the summary fields list() relies on.
+        let content = std::fs::read_to_string(dir.path().join("meta0002.jsonl")).unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(meta["turn_count"], 3);
+        assert_eq!(meta["preview"], "extra turn");
+
+        let items = HistoryFile::list(Some(dir.path())).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].turn_count, 3);
+        assert_eq!(items[0].preview, "extra turn");
+    }
+
+    #[test]
+    fn to_context_text_caps_replay_to_recent_turns() {
+        let mut hf = sample_history("cap000001", "chatgpt", "2026-08-21T10:00:00+00:00");
+        // Fill well past the char budget with old turns, then a fresh tail.
+        for i in 0..50 {
+            hf.turns.insert(
+                0,
+                turn("user", &format!("old-turn-{i}-{}", "x".repeat(5_000))),
+            );
+        }
+        hf.turns.push(turn("user", "fresh-tail"));
+        let text = hf.to_context_text();
+        assert!(
+            text.chars().count() <= MAX_CONTEXT_TEXT_CHARS + 200,
+            "replay must stay within budget: {} chars",
+            text.chars().count()
+        );
+        assert!(text.contains("fresh-tail"), "newest turn must survive");
+        assert!(
+            text.contains("earlier turns omitted"),
+            "truncation must be announced"
+        );
+        // old-turn-49 is the oldest (inserted first at index 0 repeatedly);
+        // old-turn-0 sits closest to the tail and survives.
+        assert!(!text.contains("old-turn-49-"), "oldest turns dropped");
     }
 
     #[test]
