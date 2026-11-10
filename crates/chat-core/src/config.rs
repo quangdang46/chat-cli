@@ -27,7 +27,9 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     #[serde(default)]
     pub default_provider: Option<String>,
-    #[serde(default)]
+    // Skip empty map on serialize — otherwise every save emits a bare
+    // `[providers]` table even when nothing is configured (noise in config.toml).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub providers: HashMap<String, ProviderConfig>,
 }
 

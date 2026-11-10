@@ -119,6 +119,19 @@ pub trait Provider: Send + Sync {
     fn prepare_attachments(&self, files: &[PathBuf]) -> anyhow::Result<String> {
         crate::attach::default_prepare_attachments(files)
     }
+
+    /// Whether the dispatcher should prepend the local history transcript to
+    /// the prompt (`user:`/`assistant:` replay lines).
+    ///
+    /// Providers that continue server-side via `ProviderHandle`
+    /// (`conversation_id`/`parent_message_id`) already carry prior turns —
+    /// replaying the text too would send the whole conversation twice.
+    /// Providers without server-side memory override this to `true`.
+    /// Default `false`: safe for every current provider, which all persist
+    /// server-side conversation ids.
+    fn replays_history_text(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
