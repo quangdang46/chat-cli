@@ -172,6 +172,7 @@ impl DeepSeekProvider {
         parent_message_id: Option<&str>,
         chat_session_id: &str,
         prompt: String,
+        model_type: &str,
         pow_header: Option<String>,
     ) -> anyhow::Result<(String, String)> {
         let client = Self::http_client().context("failed to build HTTP client")?;
@@ -180,7 +181,7 @@ impl DeepSeekProvider {
             .filter(|id| *id > 0);
         let payload = serde_json::json!({
             "chat_session_id": chat_session_id,
-            "model_type": "default",
+            "model_type": model_type,
             "parent_message_id": parent,
             "prompt": prompt,
             "ref_file_ids": [],
@@ -327,16 +328,18 @@ impl Provider for DeepSeekProvider {
                 "no deepseek session_token in config — run 'chat-cli auth login deepseek' first"
             )
         })?;
-        // Attachments arrive as `<<<FILE: path>>>` fenced text — inline them
-        // ahead of the prompt, same convention as the ChatGPT provider.
-        let prompt = if req.attachments_text.is_empty() {
-            req.prompt
-        } else {
-            format!("{}\n\n{}", req.attachments_text, req.prompt)
-        };
+        // The completion payload has no dedicated system field; like the
+        // ChatGPT provider, the system prompt rides as a fenced prefix on
+        // the user prompt. Attachments arrive as `<<<FILE: path>>>` fenced
+        // text — inline them ahead of the prompt too.
+        let prompt = Self::build_prompt(req.system.as_deref(), &req.attachments_text, &req.prompt);
+        // model_type is forwarded verbatim; "default" is the web default and
+        // the server validates anything else.
+        let model_type = req.model.clone().unwrap_or_else(|| "default".to_string());
         Self::chat_at(
             handle,
             prompt,
+            &model_type,
             protocol::CREATE_SESSION_URL,
             protocol::CREATE_POW_URL,
             protocol::COMPLETION_URL,
@@ -346,10 +349,26 @@ impl Provider for DeepSeekProvider {
 }
 
 impl DeepSeekProvider {
+    /// Merge `-s` system prompt, fenced attachment text and the user prompt
+    /// into the single `prompt` string the completion endpoint accepts.
+    fn build_prompt(system: Option<&str>, attachments_text: &str, prompt: &str) -> String {
+        let mut out = String::new();
+        if let Some(sys) = system {
+            out.push_str(&format!("[System instruction]: {sys}\n\n"));
+        }
+        if !attachments_text.is_empty() {
+            out.push_str(attachments_text);
+            out.push_str("\n\n");
+        }
+        out.push_str(prompt);
+        out
+    }
+
     /// Full chat flow at injectable URLs (tests mock all three endpoints).
     fn chat_at(
         handle: &ProviderHandle,
         prompt: String,
+        model_type: &str,
         create_session_url: &str,
         pow_url: &str,
         completion_url: &str,
@@ -378,6 +397,7 @@ impl DeepSeekProvider {
             parent_id,
             &chat_session_id,
             prompt,
+            model_type,
             pow_header,
         )?;
 
@@ -405,6 +425,7 @@ impl DeepSeekProvider {
         Self::chat_at(
             handle,
             prompt.to_string(),
+            "default",
             &format!("{base}/api/v0/chat_session/create"),
             &format!("{base}/api/v0/chat/create_pow_challenge"),
             &format!("{base}/api/v0/chat/completion"),
@@ -653,6 +674,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!(content, "real");
+    }
+
+    #[test]
+    fn build_prompt_prefixes_system_then_attachments_then_prompt() {
+        let p = DeepSeekProvider::build_prompt(
+            Some("be terse"),
+            "<<<FILE: a.txt>>>\n```\nctx\n```",
+            "hello",
+        );
+        assert_eq!(
+            p,
+            "[System instruction]: be terse\n\n<<<FILE: a.txt>>>\n```\nctx\n```\n\nhello"
+        );
+        // no system → attachments+prompt only; neither → bare prompt
+        assert_eq!(DeepSeekProvider::build_prompt(None, "", "hi"), "hi");
+        assert_eq!(
+            DeepSeekProvider::build_prompt(Some("s"), "", "hi"),
+            "[System instruction]: s\n\nhi"
+        );
+    }
+
+    #[test]
+    fn chat_model_type_reaches_completion_payload() {
+        let mut s = server();
+        s.mock("POST", "/api/v0/chat_session/create")
+            .with_status(200)
+            .with_body(r#"{"data":{"biz_data":{"id":"sess-m"}}}"#)
+            .create();
+        s.mock("POST", "/api/v0/chat/create_pow_challenge")
+            .with_status(404)
+            .create();
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let sink = captured.clone();
+        s.mock("POST", "/api/v0/chat/completion")
+            .with_body_from_request(move |req| {
+                *sink.lock() = Some(String::from_utf8_lossy(req.body().unwrap()).to_string());
+                "{\"p\":\"response/content\",\"o\":\"APPEND\",\"v\":\"ok\"}\n"
+                    .as_bytes()
+                    .to_vec()
+            })
+            .with_status(200)
+            .create();
+        let url = s.url();
+
+        DeepSeekProvider::chat_at(
+            &ProviderHandle::default(),
+            "hi".to_string(),
+            "deepseek-chat",
+            &format!("{url}/api/v0/chat_session/create"),
+            &format!("{url}/api/v0/chat/create_pow_challenge"),
+            &format!("{url}/api/v0/chat/completion"),
+            "tok",
+        )
+        .unwrap();
+
+        let raw = captured.lock().take().expect("request body captured");
+        let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(payload["model_type"], "deepseek-chat");
     }
 
     #[test]

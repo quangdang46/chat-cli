@@ -204,7 +204,9 @@ impl ChatGptProvider {
             }],
             conversation_id: handle.conversation_id.clone(),
             parent_message_id: parent_message_id.clone(),
-            model: "auto",
+            // "auto" is the web default; an explicit --model / config model
+            // is forwarded verbatim (the backend validates the slug).
+            model: req.model.clone().unwrap_or_else(|| "auto".to_string()),
             history_and_training_disabled: false,
         };
 
@@ -586,6 +588,7 @@ mod tests {
             system: None,
             attachments_text: String::new(),
             model: None,
+            verbose: false,
             auth: AuthContext::default(),
         }
     }
@@ -662,6 +665,41 @@ mod tests {
             payload_raw.contains("stored-conv-42") && payload_raw.contains("stored-parent-1"),
             "continue payload must carry stored ids"
         );
+    }
+
+    #[test]
+    fn chat_model_flag_reaches_conversation_payload() {
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let sink = captured.clone();
+
+        let mut s = server();
+        s.mock("POST", "/sentinel/req")
+            .with_status(200)
+            .with_body(requirements_body(false))
+            .create();
+        s.mock("POST", "/backend-api/conversation")
+            .with_body_from_request(move |req| {
+                *sink.lock() = Some(String::from_utf8_lossy(req.body().unwrap()).to_string());
+                conversation_body().into_bytes()
+            })
+            .create();
+        let base = s.url();
+
+        let mut req = chat_req();
+        req.model = Some("gpt-5".to_string());
+        ChatGptProvider::chat_at_for_test(
+            &ChatGptProvider,
+            &ProviderHandle::default(),
+            req,
+            "access-1",
+            &format!("{base}/sentinel/req"),
+            &format!("{base}/backend-api/conversation"),
+        )
+        .unwrap();
+
+        let raw = captured.lock().take().expect("request body captured");
+        let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(payload["model"], "gpt-5", "--model must not be dropped");
     }
 
     #[test]

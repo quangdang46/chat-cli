@@ -439,6 +439,7 @@ async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
         system: args.system.clone(),
         attachments_text,
         model,
+        verbose,
         auth,
     };
 
@@ -451,6 +452,7 @@ async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
             system: req.system,
             attachments_text: req.attachments_text,
             model: req.model,
+            verbose: req.verbose,
             auth: req.auth,
         }
     };

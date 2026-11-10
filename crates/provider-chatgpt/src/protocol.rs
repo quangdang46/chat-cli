@@ -149,7 +149,9 @@ pub struct ConversationPayload {
     pub conversation_id: Option<String>,
     #[serde(rename = "parent_message_id")]
     pub parent_message_id: String,
-    pub model: &'static str,
+    /// `"auto"` lets the backend pick; a concrete slug (e.g. from `--model`)
+    /// is passed through verbatim — the server validates it.
+    pub model: String,
     #[serde(rename = "history_and_training_disabled")]
     pub history_and_training_disabled: bool,
 }
@@ -271,7 +273,7 @@ mod tests {
             }],
             conversation_id: None,
             parent_message_id: "parent-uuid".into(),
-            model: "auto",
+            model: "auto".to_string(),
             history_and_training_disabled: false,
         };
         let v: serde_json::Value = serde_json::to_value(&new_payload).unwrap();
@@ -295,12 +297,18 @@ mod tests {
 
     #[test]
     fn proof_token_deterministic_for_same_seed_and_difficulty() {
-        let a = solve_proof_token("seed-x", "00ffff").unwrap();
-        let b = solve_proof_token("seed-x", "00ffff").unwrap();
-        assert_eq!(
-            a, b,
-            "same inputs must give same token (fixed counter path)"
-        );
+        // `parse_time` has one-second resolution, so two calls can
+        // legitimately differ when they straddle a second boundary. Each
+        // solve is sub-ms at this easy difficulty — retry until both land
+        // in the same second.
+        for _ in 0..100 {
+            let a = solve_proof_token("seed-x", "00ffff").unwrap();
+            let b = solve_proof_token("seed-x", "00ffff").unwrap();
+            if a == b {
+                return;
+            }
+        }
+        panic!("same-second solves must be deterministic");
     }
 
     /// Server-controlled `difficulty`: oversized values used to panic on the

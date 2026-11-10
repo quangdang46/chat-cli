@@ -233,6 +233,14 @@ impl Provider for ClaudeProvider {
             )?,
         };
 
+        // The completion payload has no dedicated system field; like the
+        // ChatGPT provider, the system prompt rides as a fenced prefix on
+        // the user prompt.
+        let prompt = match &req.system {
+            Some(sys) => format!("[System instruction]: {sys}\n\n{}", req.prompt),
+            None => req.prompt.clone(),
+        };
+
         // Attachments arrive as fenced text — ship them as a text attachment
         // so long context rides the same path the web app uses.
         let attachments = if req.attachments_text.is_empty() {
@@ -245,7 +253,7 @@ impl Provider for ClaudeProvider {
             protocol::completion_url(&org, &conversation).as_str(),
             session_key,
             &conversation,
-            protocol::build_completion_payload(&req.prompt, model, attachments),
+            protocol::build_completion_payload(&prompt, model, attachments),
         )?;
 
         Ok(ChatResp {
@@ -599,6 +607,7 @@ mod tests {
                     system: None,
                     attachments_text: String::new(),
                     model: None,
+                    verbose: false,
                     auth: chat_core::provider::AuthContext::default(),
                 },
             )

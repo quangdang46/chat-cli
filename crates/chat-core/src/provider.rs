@@ -29,6 +29,10 @@ pub struct ChatReq {
     /// Model selector: `--model` flag > `[providers.<id>].model` config.
     /// Providers with a fixed backend model ignore it.
     pub model: Option<String>,
+    /// Mirrors the CLI `--verbose` flag so providers can gate diagnostic
+    /// notes (e.g. "unknown model, using default") instead of printing them
+    /// unconditionally to stderr.
+    pub verbose: bool,
     /// Authenticated session material + persistence target for rolling refresh.
     /// Populated by the dispatcher from `config.toml`; providers that need
     /// tokens (all web providers) read it here and may write refreshed values
@@ -241,6 +245,7 @@ mod tests {
                     system: None,
                     attachments_text: String::new(),
                     model: None,
+                    verbose: false,
                     auth: AuthContext::default(),
                 },
             )

@@ -107,12 +107,18 @@ impl GeminiProvider {
             )
         })?;
 
+        // The f.req payload has no dedicated system-instruction slot; like
+        // the other providers, `-s` rides as a fenced prefix on the prompt.
         // Attachments arrive as fenced text — same inline convention.
-        let prompt = if req.attachments_text.is_empty() {
-            req.prompt.clone()
-        } else {
-            format!("{}\n\n{}", req.attachments_text, req.prompt)
-        };
+        let mut prompt = String::new();
+        if let Some(sys) = &req.system {
+            prompt.push_str(&format!("[System instruction]: {sys}\n\n"));
+        }
+        if !req.attachments_text.is_empty() {
+            prompt.push_str(&req.attachments_text);
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str(&req.prompt);
 
         let metadata = match &handle.conversation_id {
             Some(cid) => protocol::continuation_metadata(
@@ -278,6 +284,7 @@ mod tests {
             system: None,
             attachments_text: String::new(),
             model: None,
+            verbose: false,
             auth,
         }
     }

@@ -251,6 +251,19 @@ Flags:
 - `--model` overrides `[providers.<id>].model` for this turn (e.g. `-thinking` on claude enables extended thinking without editing config).
 - `--new` forces a fresh local history file; `--continue` resumes, defaulting to the most recent history for the selected provider. A provider mismatch is a hard error (a ChatGPT `conversation_id` is meaningless to DeepSeek and vice versa).
 
+**`-s` / `--model` support matrix** (per provider web protocol):
+
+| Provider | `-s` system prompt | `--model` |
+|---|---|---|
+| chatgpt | ✅ injected as `[System instruction]:` prefix in the first user part | ✅ forwarded as the payload `model` (`auto` = backend default) |
+| claude | ✅ `[System instruction]:` prefix on the prompt | ✅ model name; `-thinking` suffix toggles extended thinking |
+| deepseek | ✅ `[System instruction]:` prefix on the prompt | ✅ forwarded as `model_type` (`default` = web default) |
+| gemini | ✅ `[System instruction]:` prefix on the prompt | ⚠️ static table only (`gemini-flash`, `gemini-pro`, `gemini-flash-lite`); unknown names fall back to the account default with a `--verbose` note |
+
+Providers whose wire protocol has no dedicated system/model field receive the
+system prompt as a fenced text prefix — the same convention the ChatGPT web
+payload itself uses.
+
 ### `chat-cli history`
 
 ```bash
