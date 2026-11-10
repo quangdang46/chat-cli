@@ -13,7 +13,6 @@ use anyhow::{bail, Context};
 use chat_core::provider::{ChatReq, ChatResp, Provider, ProviderHandle, Session};
 
 pub mod protocol;
-pub use deepseek_pow as pow;
 
 /// DeepSeek access tokens are opaque JWT-ish strings; they do not expire on a
 /// schedule we can read, so there is no rolling refresh: validate at login,
@@ -92,9 +91,18 @@ impl DeepSeekProvider {
         }
 
         // Application-level rejection inside a 200 envelope.
-        let body: serde_json::Value = resp
-            .json()
-            .context("invalid JSON from deepseek probe — endpoint unavailable or shape changed")?;
+        let text = resp.text().context("failed reading deepseek probe body")?;
+        let body: serde_json::Value = serde_json::from_str(&text).with_context(|| {
+            // A rejected/expired token can surface as a non-JSON error page
+            // rather than the usual {code, msg} envelope — don't blame an
+            // "endpoint shape change" when auth is the likelier cause.
+            format!(
+                "deepseek probe returned non-JSON ({} bytes) — the session token \
+                 may be rejected/expired (re-run 'chat-cli auth login deepseek') \
+                 or the endpoint may be unavailable",
+                text.len()
+            )
+        })?;
         let app_code = body["code"].as_i64().unwrap_or(0);
         if app_code != 0 {
             return Ok(false);

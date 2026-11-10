@@ -12,21 +12,13 @@ pub const DEEPSEEK_HOST: &str = "chat.deepseek.com";
 // Endpoints — all under https://chat.deepseek.com/api/v0/
 // ---------------------------------------------------------------------------
 
-pub const LOGIN_URL: &str = "https://chat.deepseek.com/api/v0/users/login";
 pub const CREATE_SESSION_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/create";
 pub const CREATE_POW_URL: &str = "https://chat.deepseek.com/api/v0/chat/create_pow_challenge";
 pub const COMPLETION_URL: &str = "https://chat.deepseek.com/api/v0/chat/completion";
-pub const CONTINUE_URL: &str = "https://chat.deepseek.com/api/v0/chat/continue";
 pub const FETCH_SESSIONS_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/fetch_page";
-pub const DELETE_SESSION_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/delete";
-pub const DELETE_ALL_SESSIONS_URL: &str =
-    "https://chat.deepseek.com/api/v0/chat_session/delete_all";
-pub const UPLOAD_FILE_URL: &str = "https://chat.deepseek.com/api/v0/file/upload_file";
-pub const FETCH_FILES_URL: &str = "https://chat.deepseek.com/api/v0/file/fetch_files";
 
-/// Target paths used inside PoW payloads (`target_path` field).
+/// Target path used inside PoW payloads (`target_path` field).
 pub const COMPLETION_TARGET_PATH: &str = "/api/v0/chat/completion";
-pub const UPLOAD_TARGET_PATH: &str = "/api/v0/file/upload_file";
 
 // ---------------------------------------------------------------------------
 // Client identity (from constants_shared.json) → base headers
@@ -62,13 +54,6 @@ pub fn base_headers() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Base headers plus `authorization: Bearer <token>` — mirrors client_auth.go.
-pub fn auth_headers(token: &str) -> Vec<(&'static str, String)> {
-    let mut out = base_headers();
-    out.push((AUTHORIZATION_HEADER, format!("Bearer {}", token)));
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,7 +61,6 @@ mod tests {
     #[test]
     fn endpoints_match_ds2api_reference() {
         assert_eq!(DEEPSEEK_HOST, "chat.deepseek.com");
-        assert_eq!(LOGIN_URL, "https://chat.deepseek.com/api/v0/users/login");
         assert_eq!(
             CREATE_SESSION_URL,
             "https://chat.deepseek.com/api/v0/chat_session/create"
@@ -90,31 +74,10 @@ mod tests {
             "https://chat.deepseek.com/api/v0/chat/completion"
         );
         assert_eq!(
-            CONTINUE_URL,
-            "https://chat.deepseek.com/api/v0/chat/continue"
-        );
-        assert_eq!(
             FETCH_SESSIONS_URL,
             "https://chat.deepseek.com/api/v0/chat_session/fetch_page"
         );
-        assert_eq!(
-            DELETE_SESSION_URL,
-            "https://chat.deepseek.com/api/v0/chat_session/delete"
-        );
-        assert_eq!(
-            DELETE_ALL_SESSIONS_URL,
-            "https://chat.deepseek.com/api/v0/chat_session/delete_all"
-        );
-        assert_eq!(
-            UPLOAD_FILE_URL,
-            "https://chat.deepseek.com/api/v0/file/upload_file"
-        );
-        assert_eq!(
-            FETCH_FILES_URL,
-            "https://chat.deepseek.com/api/v0/file/fetch_files"
-        );
         assert_eq!(COMPLETION_TARGET_PATH, "/api/v0/chat/completion");
-        assert_eq!(UPLOAD_TARGET_PATH, "/api/v0/file/upload_file");
     }
 
     #[test]
@@ -140,31 +103,5 @@ mod tests {
         assert_eq!(get("x-client-platform").as_deref(), Some("android"));
         assert_eq!(get("x-client-version").as_deref(), Some("2.0.4"));
         assert_eq!(get("x-client-locale").as_deref(), Some("zh_CN"));
-    }
-
-    #[test]
-    fn auth_headers_add_bearer_and_keep_base() {
-        let headers = auth_headers("my-session-token");
-
-        let get = |name: &str| {
-            headers
-                .iter()
-                .find(|(k, _)| *k == name)
-                .map(|(_, v)| v.clone())
-        };
-        assert_eq!(
-            get("authorization").as_deref(),
-            Some("Bearer my-session-token")
-        );
-        // Base headers survive.
-        assert_eq!(get("Host").as_deref(), Some("chat.deepseek.com"));
-        assert_eq!(
-            get("User-Agent").as_deref(),
-            Some("DeepSeek/2.0.4 Android/35")
-        );
-
-        // No duplicate Host/Accept entries.
-        let host_count = headers.iter().filter(|(k, _)| *k == "Host").count();
-        assert_eq!(host_count, 1);
     }
 }

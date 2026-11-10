@@ -457,7 +457,12 @@ async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
         }
     };
 
-    let resp = provider.chat(&handle, final_req)?;
+    // Providers do synchronous reqwest::blocking I/O (up to the 300s client
+    // timeout) — run the turn on the blocking pool so the tokio worker
+    // stays free, same as auth_login does.
+    let resp = tokio::task::spawn_blocking(move || provider.chat(&handle, final_req))
+        .await
+        .context("chat task panicked")??;
 
     // 6. Persist history
     persist_history(&args, &provider_id, &prompt, &resp)?;

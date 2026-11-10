@@ -5,14 +5,10 @@
 //! - POST /backend-api/sentinel/chat-requirements/finalize
 //! - GET/POST /backend-api/conversation/*
 
-pub const CHATGPT_HOST: &str = "chatgpt.com";
 pub const SESSION_URL: &str = "https://chatgpt.com/api/auth/session";
-pub const SENTINEL_PREPARE_URL: &str =
-    "https://chatgpt.com/unauth-mweb/sentinel/chat-requirements/prepare";
 pub const SENTINEL_REQUIREMENTS_URL: &str =
     "https://chatgpt.com/backend-api/sentinel/chat-requirements";
 pub const CONVERSATION_URL: &str = "https://chatgpt.com/backend-api/conversation";
-pub const CONVERSATIONS_LIST_URL: &str = "https://chatgpt.com/backend-api/conversations";
 
 /// Browser cookie carrying the long-lived web session (DevTools →
 /// Application → Cookies). Pasted once at `auth login`; refreshed values are
@@ -113,7 +109,7 @@ fn validate_difficulty(difficulty: &str) -> anyhow::Result<()> {
             difficulty.len()
         );
     }
-    if difficulty.len() % 2 != 0 {
+    if !difficulty.len().is_multiple_of(2) {
         anyhow::bail!("sentinel PoW difficulty must be an even-length hex string");
     }
     if !difficulty.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -181,17 +177,14 @@ mod tests {
     fn endpoints_are_https_chatgpt_com() {
         for (name, url) in [
             ("SESSION_URL", SESSION_URL),
-            ("SENTINEL_PREPARE_URL", SENTINEL_PREPARE_URL),
             ("SENTINEL_REQUIREMENTS_URL", SENTINEL_REQUIREMENTS_URL),
             ("CONVERSATION_URL", CONVERSATION_URL),
-            ("CONVERSATIONS_LIST_URL", CONVERSATIONS_LIST_URL),
         ] {
             assert!(
                 url.starts_with("https://chatgpt.com/"),
                 "{name} must target https://chatgpt.com, got {url}"
             );
         }
-        assert_eq!(CHATGPT_HOST, "chatgpt.com");
     }
 
     #[test]
@@ -200,8 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn sentinel_urls_cover_prepare_and_requirements() {
-        assert!(SENTINEL_PREPARE_URL.ends_with("/sentinel/chat-requirements/prepare"));
+    fn sentinel_requirements_url_drives_pow_decision() {
         assert!(
             SENTINEL_REQUIREMENTS_URL.ends_with("/sentinel/chat-requirements"),
             "requirements endpoint drives the PoW decision"
@@ -213,10 +205,6 @@ mod tests {
         assert_eq!(
             CONVERSATION_URL,
             "https://chatgpt.com/backend-api/conversation"
-        );
-        assert_eq!(
-            CONVERSATIONS_LIST_URL,
-            "https://chatgpt.com/backend-api/conversations"
         );
     }
 
