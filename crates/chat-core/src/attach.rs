@@ -8,10 +8,16 @@
 //!   cat PLAN.md | chat-cli -p "..." (stdin auto-attachment if no -a)
 
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
+use std::time::Duration;
 
 const MAX_FILE_BYTES: u64 = 1_000_000; // 1 MB per file
 const MAX_TOTAL_BYTES: u64 = 5_000_000; // 5 MB total
+/// How long to wait for piped stdin to reach EOF before giving up — a
+/// held-open pipe (`tail -f | chat-cli`, agent harnesses) must not hang
+/// the CLI forever before it ever contacts the provider.
+const STDIN_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resolve raw `-a` values (already split by clap) into a deduplicated `Vec<PathBuf>`.
 /// Also handles `@file` indirection and glob expansion.
@@ -22,33 +28,54 @@ pub fn resolve_attachments(raw: &[String]) -> anyhow::Result<Vec<PathBuf>> {
         if entry.is_empty() {
             continue;
         }
+        // A value that names one real file wins over comma-splitting —
+        // filenames may legitimately contain commas. Only fall back to the
+        // `a.md,b.md` split when the unsplit value resolves to nothing.
+        if is_single_attachment(entry) {
+            push_attachment(entry, &mut out)?;
+            continue;
+        }
         // comma-separated inside a single -a value
-        let parts: Vec<&str> = entry.split(',').map(|s| s.trim()).collect();
-        for part in parts {
+        for part in entry.split(',').map(str::trim) {
             if part.is_empty() {
                 continue;
             }
-            if let Some(list_path) = part.strip_prefix('@') {
-                // @filelist.txt
-                let content = fs::read_to_string(list_path).map_err(|e| {
-                    anyhow::anyhow!("failed to read file list '{}': {}", list_path, e)
-                })?;
-                for line in content.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    expand_glob_or_push(line, &mut out)?;
-                }
-            } else {
-                expand_glob_or_push(part, &mut out)?;
-            }
+            push_attachment(part, &mut out)?;
         }
     }
     // Deduplicate preserving order
     let mut seen = std::collections::HashSet::new();
     out.retain(|p| seen.insert(p.clone()));
     Ok(out)
+}
+
+/// True when `entry` already names exactly one attachment — an existing
+/// filesystem path or an `@filelist` whose file exists. Such values must not
+/// be comma-split (filenames may contain commas).
+fn is_single_attachment(entry: &str) -> bool {
+    match entry.strip_prefix('@') {
+        Some(list_path) => PathBuf::from(list_path).exists(),
+        None => PathBuf::from(entry).exists(),
+    }
+}
+
+/// Handle one resolved attachment token: `@file` indirection or glob/path.
+fn push_attachment(part: &str, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    if let Some(list_path) = part.strip_prefix('@') {
+        // @filelist.txt — each line is one path (never comma-split).
+        let content = fs::read_to_string(list_path)
+            .map_err(|e| anyhow::anyhow!("failed to read file list '{}': {}", list_path, e))?;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            expand_glob_or_push(line, out)?;
+        }
+    } else {
+        expand_glob_or_push(part, out)?;
+    }
+    Ok(())
 }
 
 fn expand_glob_or_push(pattern: &str, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
@@ -140,13 +167,7 @@ pub fn maybe_read_stdin_as_attachment(has_attachments: bool) -> anyhow::Result<S
     if atty_check() {
         return Ok(String::new());
     }
-    let mut buf = String::new();
-    use std::io::Read;
-    // +1 byte so "exactly at the limit" and "over the limit" are
-    // distinguishable after the read.
-    std::io::stdin()
-        .take(MAX_TOTAL_BYTES + 1)
-        .read_to_string(&mut buf)?;
+    let buf = read_with_deadline(std::io::stdin(), STDIN_READ_TIMEOUT)?;
     if buf.len() as u64 > MAX_TOTAL_BYTES {
         anyhow::bail!(
             "stdin too large (>{} bytes limit) — pipe output was truncated at the cap",
@@ -154,6 +175,36 @@ pub fn maybe_read_stdin_as_attachment(has_attachments: bool) -> anyhow::Result<S
         );
     }
     build_stdin_attachment(buf)
+}
+
+/// Read `reader` to EOF on a helper thread and wait at most `timeout`.
+///
+/// `read_to_string` blocks until the writer closes the pipe; a held-open
+/// pipe would otherwise hang the CLI forever. On timeout the helper thread
+/// stays parked on the read (it cannot be cancelled) but the caller moves
+/// on — the process exits with it.
+fn read_with_deadline<R>(reader: R, timeout: Duration) -> anyhow::Result<String>
+where
+    R: Read + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        // +1 byte so "exactly at the limit" and "over the limit" are
+        // distinguishable after the read.
+        let res = reader.take(MAX_TOTAL_BYTES + 1).read_to_string(&mut buf);
+        let _ = tx.send((res, buf));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok((res, buf)) => {
+            res?;
+            Ok(buf)
+        }
+        Err(_) => anyhow::bail!(
+            "stdin did not reach EOF within {}s — close the pipe or pass the input differently",
+            timeout.as_secs()
+        ),
+    }
 }
 
 /// Pure core of stdin handling — unit-testable without controlling the real stdin.
@@ -285,6 +336,28 @@ mod tests {
             format!("{},{}", b.display(), a.display()),
         ];
         let out = resolve_attachments(&raw).unwrap();
+        assert_eq!(out, vec![a, b]);
+    }
+
+    #[test]
+    fn filename_containing_comma_is_not_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let tricky = write_file(dir.path(), "report,v2.md", "comma name");
+        // The literal path exists, so it must win over the `a,b` split —
+        // otherwise it would look for "report" and "v2.md" separately.
+        let out = resolve_attachments(&[tricky.to_string_lossy().to_string()]).unwrap();
+        assert_eq!(out, vec![tricky]);
+    }
+
+    #[test]
+    fn comma_separated_still_splits_when_unsplit_path_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_file(dir.path(), "a.md", "A");
+        let b = write_file(dir.path(), "b.md", "B");
+        // No file literally named "a.md,b.md" exists → legacy split applies.
+        let combined = format!("{},{}", a.display(), b.display());
+        assert!(!Path::new(&combined).exists());
+        let out = resolve_attachments(&[combined]).unwrap();
         assert_eq!(out, vec![a, b]);
     }
 
@@ -424,5 +497,31 @@ mod tests {
         let big = "x".repeat(MAX_TOTAL_BYTES as usize + 1);
         let err = build_stdin_attachment(big).unwrap_err();
         assert!(err.to_string().contains("stdin too large"));
+    }
+
+    #[test]
+    fn read_with_deadline_returns_full_input() {
+        let buf =
+            read_with_deadline(std::io::Cursor::new("piped data"), Duration::from_secs(5)).unwrap();
+        assert_eq!(buf, "piped data");
+    }
+
+    /// A reader that never reaches EOF inside the deadline (models a
+    /// held-open pipe) must produce an error, not a hang.
+    struct StallingReader;
+
+    impl Read for StallingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(Duration::from_secs(30));
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn read_with_deadline_times_out_on_stalled_reader() {
+        let start = std::time::Instant::now();
+        let err = read_with_deadline(StallingReader, Duration::from_millis(100)).unwrap_err();
+        assert!(err.to_string().contains("did not reach EOF"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
 }

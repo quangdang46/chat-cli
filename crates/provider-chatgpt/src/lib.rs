@@ -36,10 +36,10 @@ impl ChatGptProvider {
     /// is HTTP 200 with null accessToken and must read as invalid, not as a
     /// JSON panic.
     fn fetch_session(
+        client: &reqwest::blocking::Client,
         session_url: &str,
         token: &str,
     ) -> anyhow::Result<(bool, Option<String>, Option<String>)> {
-        let client = Self::http_client().context("failed to build HTTP client")?;
         let resp = client
             .get(session_url)
             .header("Cookie", format!("{}={}", SESSION_COOKIE_NAME, token))
@@ -63,13 +63,18 @@ impl ChatGptProvider {
 
     /// Refresh via the session endpoint and persist through `auth.persist`.
     /// Returns the fresh access_token.
-    fn refresh_access_token_at(auth: &AuthContext, session_url: &str) -> anyhow::Result<String> {
+    fn refresh_access_token_at(
+        client: &reqwest::blocking::Client,
+        auth: &AuthContext,
+        session_url: &str,
+    ) -> anyhow::Result<String> {
         let session_token = auth.session_token.as_deref().ok_or_else(|| {
             anyhow::anyhow!(
                 "no chatgpt session_token in config — run 'chat-cli auth login chatgpt' first"
             )
         })?;
-        let (valid, access_token, expiry) = Self::fetch_session(session_url, session_token)?;
+        let (valid, access_token, expiry) =
+            Self::fetch_session(client, session_url, session_token)?;
         if !valid {
             bail!(
                 "chatgpt session token is invalid or expired — re-copy {} from \
@@ -88,13 +93,14 @@ impl ChatGptProvider {
 
     /// Ensure a usable access_token: cached-and-fresh wins, else refresh.
     fn ensure_fresh_access_token_at(
+        client: &reqwest::blocking::Client,
         auth: &AuthContext,
         session_url: &str,
     ) -> anyhow::Result<String> {
         if auth.has_fresh_access_token() {
             Ok(auth.access_token.clone().expect("checked fresh"))
         } else {
-            Self::refresh_access_token_at(auth, session_url)
+            Self::refresh_access_token_at(client, auth, session_url)
         }
     }
     // Test-only seams: production paths go through the `Provider` impl with
@@ -107,7 +113,8 @@ impl ChatGptProvider {
                 SESSION_COOKIE_NAME
             );
         }
-        let (valid, _access, expires) = Self::fetch_session(session_url, token)?;
+        let client = Self::http_client().context("failed to build HTTP client")?;
+        let (valid, _access, expires) = Self::fetch_session(&client, session_url, token)?;
         Ok(Session {
             valid,
             expiry: if valid { expires } else { None },
@@ -120,7 +127,8 @@ impl ChatGptProvider {
         auth: &AuthContext,
         session_url: &str,
     ) -> anyhow::Result<String> {
-        Self::refresh_access_token_at(auth, session_url)
+        let client = Self::http_client().context("failed to build HTTP client")?;
+        Self::refresh_access_token_at(&client, auth, session_url)
     }
 
     #[cfg(test)]
@@ -129,7 +137,8 @@ impl ChatGptProvider {
         auth: &AuthContext,
         session_url: &str,
     ) -> anyhow::Result<String> {
-        Self::ensure_fresh_access_token_at(auth, session_url)
+        let client = Self::http_client().context("failed to build HTTP client")?;
+        Self::ensure_fresh_access_token_at(&client, auth, session_url)
     }
 
     /// Full chat flow at injectable URLs (tests mock both endpoints):
@@ -137,13 +146,13 @@ impl ChatGptProvider {
     /// 2. Solve PoW locally when `required`
     /// 3. `POST <conversation_url>` with the message; parse the streamed body
     fn chat_at(
+        client: &reqwest::blocking::Client,
         handle: &ProviderHandle,
         req: ChatReq,
         access_token: &str,
         requirements_url: &str,
         conversation_url: &str,
     ) -> anyhow::Result<ChatResp> {
-        let client = Self::http_client().context("failed to build HTTP client")?;
         let device_id = protocol::device_id(&req.auth);
 
         // --- Sentinel: ask whether this turn needs a proof-of-work ---
@@ -158,8 +167,10 @@ impl ChatGptProvider {
             .with_context(|| format!("POST {requirements_url} failed"))?
             .error_for_status()
             .map_err(|e| match e.status() {
-                Some(reqwest::StatusCode::UNAUTHORIZED) => anyhow::anyhow!(
-                    "401 from sentinel — session expired; run 'chat-cli auth login chatgpt --token ...' again"
+                // Keep the reqwest::Error as the source so is_unauthorized
+                // can downcast on status instead of string-matching "401".
+                Some(reqwest::StatusCode::UNAUTHORIZED) => anyhow::Error::new(e).context(
+                    "401 from sentinel — session expired; run 'chat-cli auth login chatgpt --token ...' again",
                 ),
                 Some(reqwest::StatusCode::TOO_MANY_REQUESTS) => anyhow::anyhow!(
                     "429 rate-limited by chatgpt — wait, or use '--provider deepseek'"
@@ -234,8 +245,8 @@ impl ChatGptProvider {
             .with_context(|| format!("POST {conversation_url} failed"))?
             .error_for_status()
             .map_err(|e| match e.status() {
-                Some(reqwest::StatusCode::UNAUTHORIZED) => anyhow::anyhow!(
-                    "401 from conversation endpoint — session expired; run 'chat-cli auth login chatgpt --token ...' again"
+                Some(reqwest::StatusCode::UNAUTHORIZED) => anyhow::Error::new(e).context(
+                    "401 from conversation endpoint — session expired; run 'chat-cli auth login chatgpt --token ...' again",
                 ),
                 Some(reqwest::StatusCode::TOO_MANY_REQUESTS) => anyhow::anyhow!(
                     "429 rate-limited by chatgpt — wait, or use '--provider deepseek'"
@@ -248,12 +259,15 @@ impl ChatGptProvider {
 
         Ok(ChatResp {
             content: parsed.content,
-            conversation_id: parsed.conversation_id.unwrap_or_else(|| {
-                handle
-                    .conversation_id
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string())
-            }),
+            // Empty when the stream carried no conversation id (fresh chats
+            // only — a continued handle's id is real and kept). persist_history
+            // skips empty ids so "unknown" is never stored and sent back.
+            conversation_id: parsed
+                .conversation_id
+                .or_else(|| handle.conversation_id.clone())
+                .unwrap_or_default(),
+            // user_message_id is the client-generated id actually sent in the
+            // payload, so it is safe to persist as the turn's parent.
             message_id: parsed.message_id.unwrap_or(user_message_id),
         })
     }
@@ -277,7 +291,12 @@ impl ChatGptProvider {
             if line.is_empty() || line == "data: [DONE]" {
                 continue;
             }
-            let json_str = line.strip_prefix("data: ").unwrap_or(line); // some responses omit the SSE prefix
+            // Accept both `data: {...}` and `data:{...}` — the space after
+            // the colon is optional (same convention as the claude parser).
+            let json_str = line
+                .strip_prefix("data:")
+                .map(|s| s.strip_prefix(' ').unwrap_or(s))
+                .unwrap_or(line);
             let v: serde_json::Value = match serde_json::from_str(json_str) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -327,9 +346,13 @@ impl ChatGptProvider {
         requirements_url: &str,
         conversation_url: &str,
     ) -> anyhow::Result<ChatResp> {
-        let access_token = Self::ensure_fresh_access_token_at(&req.auth, session_url)?;
+        // One client for the whole turn: session probe/refresh, sentinel and
+        // both conversation POST attempts (initial + 401 retry) share it.
+        let client = Self::http_client().context("failed to build HTTP client")?;
+        let access_token = Self::ensure_fresh_access_token_at(&client, &req.auth, session_url)?;
         let auth = req.auth.clone();
         match Self::chat_at(
+            &client,
             handle,
             req.clone(),
             &access_token,
@@ -337,18 +360,29 @@ impl ChatGptProvider {
             conversation_url,
         ) {
             Err(e) if Self::is_unauthorized(&e) => {
-                let fresh = Self::refresh_access_token_at(&auth, session_url)?;
-                Self::chat_at(handle, req, &fresh, requirements_url, conversation_url)
+                let fresh = Self::refresh_access_token_at(&client, &auth, session_url)?;
+                Self::chat_at(
+                    &client,
+                    handle,
+                    req,
+                    &fresh,
+                    requirements_url,
+                    conversation_url,
+                )
             }
             other => other,
         }
     }
 
     /// True when the error chain carries an HTTP 401 (sentinel or
-    /// conversation endpoint). Checks the whole anyhow chain because the
-    /// status may sit under a context layer.
+    /// conversation endpoint). Downcasts to `reqwest::Error` and checks the
+    /// status — a substring match on "401" would also fire on conversation
+    /// ids, URLs, or server text that merely contain those digits.
     fn is_unauthorized(e: &anyhow::Error) -> bool {
-        e.chain().any(|c| c.to_string().contains("401"))
+        e.chain().any(|c| {
+            c.downcast_ref::<reqwest::Error>()
+                .is_some_and(|re| re.status() == Some(reqwest::StatusCode::UNAUTHORIZED))
+        })
     }
 }
 
@@ -369,7 +403,8 @@ impl Provider for ChatGptProvider {
                 SESSION_COOKIE_NAME
             );
         }
-        let (valid, _access, expires) = Self::fetch_session(SESSION_URL, token)?;
+        let client = Self::http_client().context("failed to build HTTP client")?;
+        let (valid, _access, expires) = Self::fetch_session(&client, SESSION_URL, token)?;
         Ok(Session {
             valid,
             expiry: if valid { expires } else { None },
@@ -398,7 +433,9 @@ impl ChatGptProvider {
         requirements_url: &str,
         conversation_url: &str,
     ) -> anyhow::Result<ChatResp> {
+        let client = Self::http_client().context("failed to build HTTP client")?;
         Self::chat_at(
+            &client,
             handle,
             req,
             access_token,

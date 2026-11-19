@@ -1,10 +1,13 @@
 //! Local history: `~/.local/share/chat-cli/history/<id>.jsonl` append-only.
 //!
-//! Each line is a `Turn` JSON. Header metadata is stored as the first line
-//! with `role = "__meta__"`.
+//! Each line is a `Turn` JSON. The first line is a `role = "__meta__"`
+//! header written once at creation. Dynamic metadata (turn_count, preview,
+//! provider conversation ids) lives in a sidecar `<id>.meta.json` rewritten
+//! atomically on every save, so `save()` appends only the new turn lines
+//! instead of rewriting the whole file each turn (O(1) per turn, was O(n)).
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -85,23 +88,25 @@ impl HistoryFile {
         }
         fs::remove_file(&path)
             .with_context(|| format!("failed to remove history file '{}'", path.display()))?;
+        // Best-effort: drop the metadata sidecar too (missing is fine).
+        let _ = fs::remove_file(Self::meta_sidecar_for_path(&path));
         Ok(())
     }
 
-    pub fn save(&self, override_dir: Option<&Path>) -> anyhow::Result<()> {
-        let path = self.history_path(override_dir)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut out = String::new();
-        // First line: meta. `turn_count`/`preview` are duplicated here so
-        // `list()` can summarize from the first line alone (no full-file scan).
+    /// `<id>.jsonl` → `<id>.meta.json` sibling holding the live meta object.
+    fn meta_sidecar_for_path(jsonl_path: &Path) -> PathBuf {
+        jsonl_path.with_extension("meta.json")
+    }
+
+    /// Serialize the `__meta__` object (same shape as the first JSONL line,
+    /// including the `turn_count`/`preview` summary fields `list()` needs).
+    fn meta_json(&self) -> anyhow::Result<serde_json::Value> {
         let preview = self
             .turns
             .last()
             .map(|t| truncate(&t.content, 80))
             .unwrap_or_default();
-        let meta = serde_json::json!({
+        Ok(serde_json::json!({
             "role": "__meta__",
             "id": self.id,
             "provider": self.provider,
@@ -110,24 +115,146 @@ impl HistoryFile {
             "created_at": self.created_at,
             "turn_count": self.turns.len(),
             "preview": preview,
-        });
-        out.push_str(&serde_json::to_string(&meta)?);
-        out.push('\n');
-        for t in &self.turns {
-            out.push_str(&serde_json::to_string(t)?);
-            out.push('\n');
+        }))
+    }
+
+    /// FNV-1a 64 fingerprint of one serialized turn line — lets the append
+    /// path verify the on-disk tail still matches `self.turns` without
+    /// re-reading the whole file.
+    fn turn_fingerprint(line: &str) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in line.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }
-        // Atomic write (tmp + rename) with 0600 perms — same scheme as
-        // Config::save; history holds conversation content and must survive
-        // crashes without corruption or partial writes.
-        let tmp = path.with_extension("jsonl.tmp");
-        fs::write(&tmp, out)?;
+        h
+    }
+
+    /// Atomic tmp+rename write with 0600 perms — same scheme as
+    /// Config::save; history holds conversation content.
+    fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+        let tmp = path.with_extension(format!(
+            "{}.tmp",
+            path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
+        ));
+        fs::write(&tmp, contents)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
         }
-        fs::rename(&tmp, &path)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Persist the live meta object to `<id>.meta.json` (atomic, 0600).
+    /// `file_bytes`/`tail_hash` let the next `save` prove the JSONL on disk
+    /// is exactly the prefix of `self.turns` it expects before appending.
+    fn write_sidecar(
+        &self,
+        jsonl_path: &Path,
+        meta: &serde_json::Value,
+        file_bytes: u64,
+        tail_hash: u64,
+    ) -> anyhow::Result<()> {
+        let mut sidecar = meta.clone();
+        if let Some(obj) = sidecar.as_object_mut() {
+            obj.insert("file_bytes".to_string(), serde_json::json!(file_bytes));
+            obj.insert("tail_hash".to_string(), serde_json::json!(tail_hash));
+        }
+        let sidecar_path = Self::meta_sidecar_for_path(jsonl_path);
+        Self::atomic_write(&sidecar_path, serde_json::to_string(&sidecar)?.as_bytes())
+    }
+
+    /// Read the sidecar bookkeeping fields, if present and well-formed.
+    fn read_sidecar(path: &Path) -> Option<(usize, u64, u64)> {
+        let content = fs::read_to_string(Self::meta_sidecar_for_path(path)).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let turn_count = v.get("turn_count")?.as_u64()? as usize;
+        let file_bytes = v.get("file_bytes")?.as_u64()?;
+        let tail_hash = v.get("tail_hash")?.as_u64()?;
+        Some((turn_count, file_bytes, tail_hash))
+    }
+
+    /// Fingerprint of the last persisted turn line (0 when there are none).
+    fn tail_fingerprint(turns: &[Turn]) -> anyhow::Result<u64> {
+        match turns.last() {
+            Some(t) => Ok(Self::turn_fingerprint(&serde_json::to_string(t)?)),
+            None => Ok(0),
+        }
+    }
+
+    pub fn save(&self, override_dir: Option<&Path>) -> anyhow::Result<()> {
+        let path = self.history_path(override_dir)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let meta = self.meta_json()?;
+        let meta_line = serde_json::to_string(&meta)?;
+
+        if path.exists() {
+            // Append path: the sidecar records how many leading turns were
+            // persisted, the exact file size, and a fingerprint of the last
+            // persisted turn — all three must match or we fall back to a
+            // full atomic rewrite (legacy files without a sidecar, or any
+            // crash/corruption divergence). Only the NEW suffix is
+            // serialized, keeping save() O(new turns), not O(history).
+            let file_len = fs::metadata(&path)?.len();
+            let append_from = Self::read_sidecar(&path).and_then(|(count, bytes, tail)| {
+                if bytes != file_len || count > self.turns.len() {
+                    return None;
+                }
+                if count > 0 {
+                    let line = serde_json::to_string(&self.turns[count - 1]).ok()?;
+                    if Self::turn_fingerprint(&line) != tail {
+                        return None;
+                    }
+                }
+                Some(count)
+            });
+
+            if let Some(k) = append_from {
+                // Turns[..k] are already on disk as whole lines; append the
+                // suffix in one write_all + fsync so a crash can at worst
+                // leave a torn FINAL line (detected next save via the
+                // file_bytes check → full rewrite), never corrupt earlier
+                // lines.
+                let mut suffix = String::new();
+                for t in &self.turns[k..] {
+                    suffix.push_str(&serde_json::to_string(t)?);
+                    suffix.push('\n');
+                }
+                if !suffix.is_empty() {
+                    let mut f = fs::OpenOptions::new().append(true).open(&path)?;
+                    f.write_all(suffix.as_bytes())?;
+                    f.sync_all()?;
+                }
+                let tail_hash = Self::tail_fingerprint(&self.turns)?;
+                self.write_sidecar(&path, &meta, file_len + suffix.len() as u64, tail_hash)?;
+                return Ok(());
+            }
+        }
+
+        // New file, or legacy/diverged file: atomic rewrite — meta line +
+        // all turns in one tmp+rename (0600), then refresh the sidecar.
+        let mut out = String::with_capacity(
+            meta_line.len()
+                + 1
+                + self
+                    .turns
+                    .iter()
+                    .map(|t| t.content.len() + 64)
+                    .sum::<usize>(),
+        );
+        out.push_str(&meta_line);
+        out.push('\n');
+        for t in &self.turns {
+            out.push_str(&serde_json::to_string(t)?);
+            out.push('\n');
+        }
+        Self::atomic_write(&path, out.as_bytes())?;
+        let tail_hash = Self::tail_fingerprint(&self.turns)?;
+        self.write_sidecar(&path, &meta, out.len() as u64, tail_hash)?;
         Ok(())
     }
 
@@ -135,7 +262,22 @@ impl HistoryFile {
         let path = Self::path_for_id(id, override_dir)?;
         let content = fs::read_to_string(&path)
             .with_context(|| format!("failed to read history file '{}'", path.display()))?;
-        Self::from_jsonl(&content)
+        let mut hf = Self::from_jsonl(&content)?;
+        // The first-line __meta__ is a creation-time snapshot; the sidecar
+        // carries the live provider conversation ids (rewritten every save).
+        if let Ok(sidecar) = fs::read_to_string(Self::meta_sidecar_for_path(&path)) {
+            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&sidecar) {
+                hf.provider_conversation_id = meta
+                    .get("provider_conversation_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                hf.provider_parent_message_id = meta
+                    .get("provider_parent_message_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+            }
+        }
+        Ok(hf)
     }
 
     pub fn from_jsonl(content: &str) -> anyhow::Result<Self> {
@@ -184,10 +326,13 @@ impl HistoryFile {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            // Fast path: `save` duplicates turn_count/preview into the __meta__
-            // first line, so a summary needs only that line — not a full
-            // parse of every turn in every file.
-            if let Some(summary) = Self::summary_from_meta_line(&path) {
+            // Fast path: the `<id>.meta.json` sidecar (new files) or the
+            // `turn_count`/`preview` fields duplicated into the __meta__
+            // first line (legacy files) let a summary be built from one
+            // small read — not a full parse of every turn in every file.
+            if let Some(summary) =
+                Self::summary_from_sidecar(&path).or_else(|| Self::summary_from_meta_line(&path))
+            {
                 out.push(summary);
                 continue;
             }
@@ -214,6 +359,25 @@ impl HistoryFile {
         }
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(out)
+    }
+
+    /// Build a `HistorySummary` from the `<id>.meta.json` sidecar written by
+    /// `save` — one small file read per history, no JSONL scan at all.
+    fn summary_from_sidecar(jsonl_path: &Path) -> Option<HistorySummary> {
+        let content = fs::read_to_string(Self::meta_sidecar_for_path(jsonl_path)).ok()?;
+        let meta: serde_json::Value = serde_json::from_str(&content).ok()?;
+        if meta.get("role").and_then(|v| v.as_str()) != Some("__meta__") {
+            return None;
+        }
+        let turn_count = meta.get("turn_count")?.as_u64()? as usize;
+        let preview = meta.get("preview")?.as_str()?.to_string();
+        Some(HistorySummary {
+            id: meta.get("id")?.as_str()?.to_string(),
+            provider: meta.get("provider")?.as_str()?.to_string(),
+            created_at: meta.get("created_at")?.as_str()?.to_string(),
+            turn_count,
+            preview,
+        })
     }
 
     /// Build a `HistorySummary` from only the first (`__meta__`) line of a
@@ -262,10 +426,28 @@ impl HistoryFile {
         let omitted = self.turns.len() - kept.len();
         let mut s = String::new();
         if omitted > 0 {
-            s.push_str(&format!("[... {omitted} earlier turns omitted ...]\n"));
+            s.push_str("[... ");
+            s.push_str(&omitted.to_string());
+            s.push_str(" earlier turns omitted ...]\n");
         }
-        for t in kept {
-            s.push_str(&format!("{}: {}\n", t.role, t.content));
+        for (i, t) in kept.iter().enumerate() {
+            // The newest turn is always kept even when it alone exceeds the
+            // budget — replaying it whole would then fail budget_check and
+            // kill the whole chat. Truncate it head+tail instead.
+            let is_newest = i + 1 == kept.len();
+            let overhead = t.role.len() + 4; // "role: \n"
+            if is_newest && overhead + t.content.len() > MAX_CONTEXT_TEXT_CHARS {
+                let budget = MAX_CONTEXT_TEXT_CHARS.saturating_sub(overhead);
+                s.push_str(&t.role);
+                s.push_str(": ");
+                s.push_str(&truncate_middle(&t.content, budget));
+                s.push('\n');
+            } else {
+                s.push_str(&t.role);
+                s.push_str(": ");
+                s.push_str(&t.content);
+                s.push('\n');
+            }
         }
         s
     }
@@ -317,11 +499,36 @@ pub fn validate_history_id(id: &str) -> anyhow::Result<()> {
 
 fn truncate(s: &str, n: usize) -> String {
     // Char-boundary safe: byte slicing would panic on multibyte UTF-8.
-    if s.chars().count() <= n {
+    // Single pass: the byte index of the n-th char boundary is the cut point.
+    match s.char_indices().nth(n) {
+        Some((byte_idx, _)) => {
+            let mut out = String::with_capacity(byte_idx + 3);
+            out.push_str(&s[..byte_idx]);
+            out.push_str("...");
+            out
+        }
+        None => s.to_string(),
+    }
+}
+
+/// Truncate `s` to about `max_chars`, keeping the head and tail with an
+/// omission marker — better than a head-only cut for code/log-shaped turns
+/// where the end carries the answer.
+fn truncate_middle(s: &str, max_chars: usize) -> String {
+    const MARKER: &str = "\n[... middle omitted ...]\n";
+    if s.chars().count() <= max_chars {
         return s.to_string();
     }
-    let cut: String = s.chars().take(n).collect();
-    format!("{}...", cut)
+    let budget = max_chars.saturating_sub(MARKER.chars().count());
+    if budget == 0 {
+        return MARKER.trim().to_string();
+    }
+    let head = budget / 2;
+    let tail = budget - head;
+    let total = s.chars().count();
+    let head_s: String = s.chars().take(head).collect();
+    let tail_s: String = s.chars().skip(total - tail).collect();
+    format!("{head_s}{MARKER}{tail_s}")
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +798,28 @@ mod tests {
     }
 
     #[test]
+    fn to_context_text_truncates_single_oversized_newest_turn() {
+        let mut hf = sample_history("big00001", "chatgpt", "2026-08-21T10:00:00+00:00");
+        // One turn larger than the whole replay budget: it must be cut
+        // head+tail (with a marker), not replayed whole — a whole replay
+        // would blow the provider budget check and fail the chat.
+        let huge = format!("HEAD-{}-TAIL", "x".repeat(MAX_CONTEXT_TEXT_CHARS + 10_000));
+        hf.turns = vec![turn("user", &huge)];
+        let text = hf.to_context_text();
+        assert!(
+            text.chars().count() <= MAX_CONTEXT_TEXT_CHARS + 200,
+            "oversized turn must be truncated: {} chars",
+            text.chars().count()
+        );
+        assert!(
+            text.contains("middle omitted"),
+            "truncation must be announced"
+        );
+        assert!(text.contains("HEAD-"), "head must survive");
+        assert!(text.contains("-TAIL"), "tail must survive");
+    }
+
+    #[test]
     fn list_orders_by_created_at_desc_and_skips_non_history_files() {
         let dir = tempfile::tempdir().unwrap();
 
@@ -698,5 +927,64 @@ mod tests {
         assert_eq!(loaded.turns.len(), 3);
         assert_eq!(loaded.turns[2].content, "follow-up");
         assert_eq!(loaded.provider_conversation_id.as_deref(), Some("conv-new"));
+    }
+
+    #[test]
+    fn save_appends_only_new_turn_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hf = sample_history("app00002", "chatgpt", "2026-08-21T10:00:00+00:00");
+        hf.save(Some(dir.path())).unwrap();
+        let path = dir.path().join("app00002.jsonl");
+        let after_first = std::fs::read_to_string(&path).unwrap();
+
+        hf.turns.push(turn("user", "second"));
+        hf.turns.push(turn("assistant", "third"));
+        hf.save(Some(dir.path())).unwrap();
+        let after_second = std::fs::read_to_string(&path).unwrap();
+
+        // The original bytes must be a strict prefix — nothing rewritten.
+        assert!(
+            after_second.starts_with(&after_first),
+            "append-only save must not rewrite existing lines"
+        );
+        assert_eq!(
+            after_second.lines().count(),
+            after_first.lines().count() + 2
+        );
+
+        // Sidecar carries the live summary for list().
+        let items = HistoryFile::list(Some(dir.path())).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].turn_count, 4);
+        assert_eq!(items[0].preview, "third");
+
+        // And load() sees the appended turns plus live conv ids.
+        let loaded = HistoryFile::load("app00002", Some(dir.path())).unwrap();
+        assert_eq!(loaded.turns.len(), 4);
+        assert_eq!(loaded.turns[3].content, "third");
+    }
+
+    #[test]
+    fn save_falls_back_to_rewrite_when_sidecar_diverges() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hf = sample_history("app00003", "chatgpt", "2026-08-21T10:00:00+00:00");
+        hf.save(Some(dir.path())).unwrap();
+        let path = dir.path().join("app00003.jsonl");
+
+        // Simulate external corruption: append garbage bytes to the JSONL.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"garbage\n").unwrap();
+        drop(f);
+
+        // Next save must detect the size mismatch and rewrite cleanly.
+        hf.turns.push(turn("user", "after-corruption"));
+        hf.save(Some(dir.path())).unwrap();
+        let loaded = HistoryFile::load("app00003", Some(dir.path())).unwrap();
+        assert_eq!(loaded.turns.len(), 3);
+        assert_eq!(loaded.turns[2].content, "after-corruption");
     }
 }

@@ -16,6 +16,7 @@
 use anyhow::{bail, Context};
 use regex::Regex;
 use serde_json::{json, Value};
+use std::sync::LazyLock;
 
 pub const INIT_URL: &str = "https://gemini.google.com/app";
 pub const GENERATE_URL: &str =
@@ -55,17 +56,33 @@ pub struct InitInfo {
 
 /// Extract bootstrap values from the init page HTML.
 pub fn extract_init(html: &str) -> InitInfo {
-    let grab = |key: &str| -> Option<String> {
-        let re = Regex::new(&format!(r#""{key}":\s*"(.*?)""#)).ok()?;
-        re.captures(html)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string())
-    };
     InitInfo {
-        access_token: grab("SNlM0e"),
-        build_label: grab("cfb2h"),
-        session_id: grab("FdrFJe"),
+        access_token: grab_json_string(html, "SNlM0e"),
+        build_label: grab_json_string(html, "cfb2h"),
+        session_id: grab_json_string(html, "FdrFJe"),
     }
+}
+
+/// Find `"key": "value"` in the page and return the raw value — same
+/// semantics as the old `"key":\s*"(.*?)"` regex (first `"` ends the value,
+/// escapes are not interpreted) without compiling a regex per call.
+fn grab_json_string(html: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let mut search_from = 0usize;
+    while let Some(rel) = html[search_from..].find(&needle) {
+        let after_key = search_from + rel + needle.len();
+        let rest = html[after_key..].trim_start();
+        if let Some(rest) = rest.strip_prefix(':') {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('"') {
+                if let Some(end) = rest.find('"') {
+                    return Some(rest[..end].to_string());
+                }
+            }
+        }
+        search_from = after_key;
+    }
+    None
 }
 
 /// Parse the login paste into `(1PSID, Option<1PSIDTS>)`.
@@ -83,18 +100,13 @@ pub fn parse_cookie_credentials(pasted: &str) -> anyhow::Result<(String, Option<
     }
 
     if trimmed.contains(COOKIE_PSID) {
-        let named = |name: &str| -> Option<String> {
-            let re = Regex::new(&format!(r"{name}\s*=\s*([^;\s]+)")).ok()?;
-            re.captures(trimmed)
-                .and_then(|c| c.get(1))
-                .map(|m| m.as_str().to_string())
-        };
         // `__Secure-1PSID=` cannot match inside `__Secure-1PSIDTS=` (the next
-        // char is `T`), so both regexes are unambiguous.
-        let psid = named(COOKIE_PSID).ok_or_else(|| {
+        // char is `T`), so both lookups are unambiguous — same semantics as
+        // the old `{name}\s*=\s*([^;\s]+)` regex, without compiling it.
+        let psid = cookie_value(trimmed, COOKIE_PSID).ok_or_else(|| {
             anyhow::anyhow!("paste contains cookie names but no {COOKIE_PSID} value")
         })?;
-        return Ok((psid, named(COOKIE_PSIDTS)));
+        return Ok((psid, cookie_value(trimmed, COOKIE_PSIDTS)));
     }
 
     // Bare value(s): 1PSID values never contain `;`, `=` or whitespace.
@@ -111,6 +123,36 @@ pub fn parse_cookie_credentials(pasted: &str) -> anyhow::Result<(String, Option<
              {COOKIE_PSIDTS} (e.g. `__Secure-1PSID=…; __Secure-1PSIDTS=…`)"
         ),
     }
+}
+
+/// Extract `name=value` from a cookie paste without regex: first `name`
+/// occurrence followed by optional whitespace, `=`, optional whitespace,
+/// then a run of non-`;`/non-whitespace bytes. Same semantics as the old
+/// `{name}\s*=\s*([^;\s]+)` regex.
+fn cookie_value(text: &str, name: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut search_from = 0usize;
+    while let Some(rel) = text[search_from..].find(name) {
+        let mut i = search_from + rel + name.len();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let start = i;
+            while i < bytes.len() && bytes[i] != b';' && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i > start {
+                return Some(text[start..i].to_string());
+            }
+        }
+        search_from = search_from + rel + name.len();
+    }
+    None
 }
 
 pub fn cookie_header(psid: &str, psidts: Option<&str>) -> String {
@@ -292,10 +334,10 @@ pub fn parse_frames(body: &str) -> anyhow::Result<Vec<Value>> {
 
         rest = &after_newline[end_byte..];
         if let Ok(frame) = serde_json::from_str::<Value>(&after_newline[..end_byte]) {
-            if let Some(arr) = frame.as_array() {
-                parts.extend(arr.iter().cloned());
-            } else {
-                parts.push(frame);
+            // Move the array elements instead of deep-cloning every one.
+            match frame {
+                Value::Array(arr) => parts.extend(arr),
+                other => parts.push(other),
             }
         }
     }
@@ -328,11 +370,15 @@ pub struct GenerateOutcome {
 
 const CARD_CONTENT_PREFIX: &str = "https://googleusercontent.com/card_content/";
 
+/// Compiled once — strip_artifacts runs per candidate per frame.
+static CARD_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"https?://googleusercontent\.com/(?:\w+/)+\d+\n*").expect("valid regex")
+});
+
 fn strip_artifacts(text: &str) -> String {
     // Placeholder links where rendered attachments belong, possibly multi
     // segment paths, optionally followed by newlines.
-    let re = Regex::new(r"https?://googleusercontent\.com/(?:\w+/)+\d+\n*").expect("valid regex");
-    re.replace_all(text, "").to_string()
+    CARD_LINK_RE.replace_all(text, "").to_string()
 }
 
 /// Candidate text: `[1][0]`, with the card-placeholder fallback at `[22][0]`.
@@ -431,13 +477,17 @@ pub fn parse_generate_response(body: &str) -> anyhow::Result<GenerateOutcome> {
     Ok(outcome)
 }
 
+/// Compiled once — called per response for Set-Cookie scanning.
+static PSIDTS_COOKIE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)__Secure-1PSIDTS=([^;\s]+)").expect("valid regex"));
+
 /// Extract a rotated `__Secure-1PSIDTS` value from Set-Cookie headers.
 pub fn rotated_psidts_from_headers<'a, I: Iterator<Item = &'a str>>(
     mut set_cookies: I,
 ) -> Option<String> {
-    let re = Regex::new(r"(?i)__Secure-1PSIDTS=([^;\s]+)").expect("valid regex");
     set_cookies.find_map(|c| {
-        re.captures(c)
+        PSIDTS_COOKIE_RE
+            .captures(c)
             .and_then(|caps| caps.get(1))
             .map(|m| m.as_str().to_string())
     })

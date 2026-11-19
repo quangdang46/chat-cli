@@ -245,13 +245,14 @@ async fn auth_login(
     // `__Secure-next-auth.session-token.0` + `.1`; users paste the parts
     // joined with commas — concatenate them back into one token (#snippet UX).
     let token = if provider_id == "chatgpt" && token.contains(',') {
-        let merged: String = token
+        let parts: Vec<&str> = token
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .concat();
-        eprintln!("[info] merged {} cookie parts into one token", merged.len());
+            .collect();
+        let part_count = parts.len();
+        let merged: String = parts.concat();
+        eprintln!("[info] merged {part_count} cookie parts into one token");
         merged
     } else {
         token
@@ -285,7 +286,11 @@ DevTools → Application → Cookies — the 1PSIDTS value expires quickly"
     {
         let entry = cfg.providers.entry(provider_id.to_string()).or_default();
         entry.session_token = Some(token.clone());
-        entry.access_token_expiry = session.expiry.clone();
+        // provider.auth() validates the paste but Session carries no access
+        // token, so any cached pair belongs to the OLD session — leaving it
+        // would let has_fresh_access_token treat a stale token as fresh.
+        entry.access_token = None;
+        entry.access_token_expiry = None;
     }
     if set_default {
         cfg.default_provider = Some(provider_id.to_string());
@@ -390,7 +395,8 @@ async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
     })
     .await
     .context("stdin attachment task panicked")??;
-    let attachments_text = format!("{}{}", attachments_text, stdin_text);
+    let mut attachments_text = attachments_text;
+    attachments_text.push_str(&stdin_text);
     vlog!(
         "attachments: {} file(s), {} chars (stdin: {})",
         file_count,
@@ -402,7 +408,8 @@ async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
     // already carry prior turns — only providers without server-side memory
     // get the transcript replayed into the prompt (double-replay fix).
     let replay_text = provider.replays_history_text();
-    let (handle, history_text) = resolve_history(&args, &provider_id, replay_text)?;
+    let (handle, history_text, resolved_history) =
+        resolve_history(&args, &provider_id, replay_text)?;
     vlog!(
         "history: conversation_id={:?} parent_message_id={:?} context_chars={}",
         handle.conversation_id,
@@ -476,8 +483,12 @@ async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
     let final_req = if history_text.is_empty() {
         req
     } else {
+        // Pre-size instead of format!("{}{}") which copies both blobs blindly.
+        let mut combined = String::with_capacity(history_text.len() + prompt.len());
+        combined.push_str(&history_text);
+        combined.push_str(&prompt);
         chat_core::provider::ChatReq {
-            prompt: format!("{}{}", history_text, prompt),
+            prompt: combined,
             system: req.system,
             attachments_text: req.attachments_text,
             model: req.model,
@@ -493,11 +504,13 @@ async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
         .await
         .context("chat task panicked")??;
 
-    // 6. Persist history
-    persist_history(&args, &provider_id, &prompt, &resp)?;
-
-    // 7. Output
+    // 6. Output first: a history-write failure must not discard a paid,
+    //    already-received answer.
     println!("{}", resp.content);
+
+    // 7. Persist history — reuse the HistoryFile resolve_history already
+    // loaded (or None → fresh file) instead of re-scanning + re-parsing.
+    persist_history(&provider_id, &prompt, &resp, resolved_history)?;
 
     Ok(())
 }
@@ -505,15 +518,21 @@ async fn run_chat(prompt: String, args: Args) -> anyhow::Result<()> {
 /// Resolve the continuation handle + optional history transcript.
 /// `replay_text` is the provider's `replays_history_text()` capability — when
 /// false the transcript is NOT built (server-side continuation carries it).
+/// Returns the loaded `HistoryFile` too so `persist_history` can append to it
+/// without a second `list()`+`load()` of the same conversation.
 fn resolve_history(
     args: &Args,
     provider_id: &str,
     replay_text: bool,
-) -> anyhow::Result<(chat_core::provider::ProviderHandle, String)> {
+) -> anyhow::Result<(
+    chat_core::provider::ProviderHandle,
+    String,
+    Option<HistoryFile>,
+)> {
     use chat_core::provider::ProviderHandle;
 
     if args.new {
-        return Ok((ProviderHandle::default(), String::new()));
+        return Ok((ProviderHandle::default(), String::new(), None));
     }
 
     // --continue <id> or --continue (empty = most recent)
@@ -533,9 +552,9 @@ fn resolve_history(
                 } else {
                     String::new()
                 };
-                return Ok((handle, text));
+                return Ok((handle, text, Some(hf)));
             }
-            return Ok((ProviderHandle::default(), String::new()));
+            return Ok((ProviderHandle::default(), String::new(), None));
         } else {
             // Friendly not-found + id validation (traversal-safe) — same path
             // as `history show`, so --continue <bogus> no longer leaks OS errors.
@@ -550,7 +569,7 @@ fn resolve_history(
             } else {
                 String::new()
             };
-            return Ok((handle, text));
+            return Ok((handle, text, Some(hf)));
         }
     }
 
@@ -568,50 +587,34 @@ fn resolve_history(
         } else {
             String::new()
         };
-        return Ok((handle, text));
+        return Ok((handle, text, Some(hf)));
     }
-    Ok((ProviderHandle::default(), String::new()))
+    Ok((ProviderHandle::default(), String::new(), None))
 }
 
 fn persist_history(
-    args: &Args,
     provider_id: &str,
     prompt: &str,
     resp: &chat_core::provider::ChatResp,
+    resolved: Option<HistoryFile>,
 ) -> anyhow::Result<()> {
     use chrono::Utc;
 
-    // Determine which history file to append to
-    let mut hf = if args.new {
-        HistoryFile::new(provider_id)
-    } else if let Some(ref cid) = args.continue_id {
-        if cid.is_empty() {
-            // most recent
-            let mut items = HistoryFile::list(None)?;
-            items.retain(|h| h.provider == provider_id);
-            if let Some(item) = items.into_iter().next() {
-                HistoryFile::load(&item.id, None)?
-            } else {
-                HistoryFile::new(provider_id)
-            }
-        } else {
-            // Friendly not-found + traversal-safe id validation, same as
-            // resolve_history — a bogus --continue=<id> must not leak OS errors.
-            load_history_or_not_found(cid)?
-        }
-    } else {
-        // default continue most recent
-        let mut items = HistoryFile::list(None)?;
-        items.retain(|h| h.provider == provider_id);
-        if let Some(item) = items.into_iter().next() {
-            HistoryFile::load(&item.id, None)?
-        } else {
-            HistoryFile::new(provider_id)
-        }
-    };
+    // `resolved` is the HistoryFile resolve_history already loaded for this
+    // turn (None → --new or no prior history existed): reuse it instead of
+    // paying a second dir scan + full parse of the active conversation.
+    let mut hf = resolved.unwrap_or_else(|| HistoryFile::new(provider_id));
 
-    hf.provider_conversation_id = Some(resp.conversation_id.clone());
-    hf.provider_parent_message_id = Some(resp.message_id.clone());
+    // Providers return "" for ids the server never issued (truncated
+    // streams, missing fields). Persisting a placeholder would send it back
+    // as a real provider id next turn — skip empties and keep the prior
+    // handle instead.
+    if !resp.conversation_id.is_empty() {
+        hf.provider_conversation_id = Some(resp.conversation_id.clone());
+    }
+    if !resp.message_id.is_empty() {
+        hf.provider_parent_message_id = Some(resp.message_id.clone());
+    }
     hf.turns.push(chat_core::history::Turn {
         role: "user".to_string(),
         content: prompt.to_string(),

@@ -34,8 +34,11 @@ impl GeminiProvider {
     }
 
     /// Fetch the init page and extract the bootstrap session values.
-    fn init_session(init_url: &str, cookie_value: &str) -> anyhow::Result<protocol::InitInfo> {
-        let client = Self::http_client().context("failed to build HTTP client")?;
+    fn init_session(
+        client: &reqwest::blocking::Client,
+        init_url: &str,
+        cookie_value: &str,
+    ) -> anyhow::Result<protocol::InitInfo> {
         let resp = client
             .get(init_url)
             .header("Cookie", cookie_value)
@@ -49,6 +52,12 @@ impl GeminiProvider {
         }
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             bail!("{} from gemini.google.com — cookies rejected; re-run 'chat-cli auth login gemini' with fresh cookies", status.as_u16());
+        }
+        // Any other non-2xx (5xx outage, captive-portal HTML, etc.) must not
+        // fall through to extract_init — a missing SNlM0e there would be
+        // misreported as "cookies expired".
+        if !status.is_success() {
+            bail!("GET {init_url} returned {status}: init page unavailable, retry later");
         }
         let html = resp.text().context("failed reading the Gemini init page")?;
         Ok(protocol::extract_init(&html))
@@ -75,6 +84,10 @@ impl GeminiProvider {
         init_url: &str,
         generate_url: &str,
     ) -> anyhow::Result<ChatResp> {
+        // One client for the whole turn — init page + StreamGenerate share
+        // the TLS session.
+        let client = Self::http_client().context("failed to build HTTP client")?;
+
         let psid = req.auth.session_token.as_deref().ok_or_else(|| {
             anyhow::anyhow!("no gemini cookies in config — run 'chat-cli auth login gemini' first")
         })?;
@@ -103,7 +116,7 @@ impl GeminiProvider {
             None => None,
         };
 
-        let info = Self::init_session(init_url, &cookie_value)?;
+        let info = Self::init_session(&client, init_url, &cookie_value)?;
         let access_token = info.access_token.ok_or_else(|| {
             anyhow::anyhow!(
                 "init page carried no SNlM0e token — cookies expired or region-blocked; \
@@ -141,7 +154,6 @@ impl GeminiProvider {
                 .subsec_nanos())
                 % 90_000;
 
-        let client = Self::http_client().context("failed to build HTTP client")?;
         let f_req = protocol::build_f_req(&prompt, &metadata, model.as_ref(), &request_uuid);
 
         let mut rb = client
@@ -201,16 +213,11 @@ impl GeminiProvider {
 
         Ok(ChatResp {
             content: outcome.text,
-            conversation_id: if outcome.cid.is_empty() {
-                format!("gm-{}", uuid::Uuid::new_v4())
-            } else {
-                outcome.cid
-            },
-            message_id: if outcome.rid.is_empty() {
-                format!("gm-{}", uuid::Uuid::new_v4())
-            } else {
-                outcome.rid
-            },
+            // Empty when the stream carried no ids — persist_history skips
+            // empty ids so a synthetic value is never sent back as a real
+            // [cid, rid] pair on the next turn.
+            conversation_id: outcome.cid,
+            message_id: outcome.rid,
         })
     }
 }
@@ -227,7 +234,9 @@ impl Provider for GeminiProvider {
 
     fn auth(&self, token: &str) -> anyhow::Result<Session> {
         let (psid, psidts) = protocol::parse_cookie_credentials(token)?;
+        let client = Self::http_client().context("failed to build HTTP client")?;
         let info = Self::init_session(
+            &client,
             protocol::INIT_URL,
             &protocol::cookie_header(&psid, psidts.as_deref()),
         )?;
@@ -341,7 +350,9 @@ mod tests {
             .create();
         let url = s.url();
 
+        let client = GeminiProvider::http_client().unwrap();
         let info = GeminiProvider::init_session(
+            &client,
             &format!("{url}/app"),
             "__Secure-1PSID=psid-v; __Secure-1PSIDTS=psidts-v",
         )
@@ -373,10 +384,29 @@ mod tests {
         let mut s = server();
         let _m = s.mock("GET", "/app").with_status(429).create();
         let url = s.url();
-        let err = GeminiProvider::init_session(&format!("{url}/app"), "__Secure-1PSID=g.psid")
-            .unwrap_err();
+        let client = GeminiProvider::http_client().unwrap();
+        let err =
+            GeminiProvider::init_session(&client, &format!("{url}/app"), "__Secure-1PSID=g.psid")
+                .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("429") && msg.contains("proxy"), "{msg}");
+    }
+
+    #[test]
+    fn init_5xx_is_unavailable_not_cookies_expired() {
+        let mut s = server();
+        let _m = s.mock("GET", "/app").with_status(503).create();
+        let url = s.url();
+        let client = GeminiProvider::http_client().unwrap();
+        let err =
+            GeminiProvider::init_session(&client, &format!("{url}/app"), "__Secure-1PSID=g.psid")
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("503") && msg.contains("unavailable"), "{msg}");
+        assert!(
+            !msg.contains("cookies"),
+            "must not blame the cookies: {msg}"
+        );
     }
 
     #[test]

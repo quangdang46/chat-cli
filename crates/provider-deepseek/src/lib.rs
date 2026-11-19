@@ -14,6 +14,13 @@ use chat_core::provider::{ChatReq, ChatResp, Provider, ProviderHandle, Session};
 
 pub mod protocol;
 
+/// Application-level `code` values in the 200 envelope that mean the token
+/// itself was rejected. Any OTHER nonzero code is a server-side error and
+/// must surface as an error — not be conflated with an auth failure.
+const AUTH_FAILURE_CODES: &[i64] = &[
+    40003, // "Authorization Failed (invalid token)"
+];
+
 /// DeepSeek access tokens are opaque JWT-ish strings; they do not expire on a
 /// schedule we can read, so there is no rolling refresh: validate at login,
 /// trust until a 401.
@@ -70,10 +77,13 @@ impl DeepSeekProvider {
     /// (`{"code":40003,"msg":"Authorization Failed (invalid token)","data":null}`)
     /// for bad tokens (#3), so a 2xx status alone proves nothing — the body's
     /// `code`/`data` must be checked too.
-    fn probe_token(probe_url: &str, token: &str) -> anyhow::Result<bool> {
-        let client = Self::http_client().context("failed to build HTTP client")?;
+    fn probe_token(
+        client: &reqwest::blocking::Client,
+        probe_url: &str,
+        token: &str,
+    ) -> anyhow::Result<bool> {
         let resp = Self::request(
-            &client,
+            client,
             reqwest::Method::GET,
             &format!("{probe_url}?lte_cursor.pinned=false"),
             Some(token),
@@ -103,18 +113,28 @@ impl DeepSeekProvider {
                 text.len()
             )
         })?;
-        let app_code = body["code"].as_i64().unwrap_or(0);
+        // `code` may arrive as a number or a numeric string; missing/zero
+        // means success. Only known auth-failure codes read as "token
+        // rejected" — other nonzero codes are server errors, not bad auth.
+        let app_code = Self::extract_int(&body["code"]).unwrap_or(0);
         if app_code != 0 {
-            return Ok(false);
+            if AUTH_FAILURE_CODES.contains(&app_code) {
+                return Ok(false);
+            }
+            let msg = body["msg"].as_str().unwrap_or("unknown error");
+            bail!("deepseek probe returned error code {app_code}: {msg}");
         }
         Ok(true)
     }
 
     /// Create a fresh chat session; returns its id.
-    fn create_chat_session(create_url: &str, token: &str) -> anyhow::Result<String> {
-        let client = Self::http_client().context("failed to build HTTP client")?;
+    fn create_chat_session(
+        client: &reqwest::blocking::Client,
+        create_url: &str,
+        token: &str,
+    ) -> anyhow::Result<String> {
         let resp = Self::request(
-            &client,
+            client,
             reqwest::Method::POST,
             create_url,
             Some(token),
@@ -142,10 +162,13 @@ impl DeepSeekProvider {
     }
 
     /// Ask for a PoW challenge targeting the completion endpoint and solve it.
-    fn solve_completion_pow(pow_url: &str, token: &str) -> anyhow::Result<String> {
-        let client = Self::http_client().context("failed to build HTTP client")?;
+    fn solve_completion_pow(
+        client: &reqwest::blocking::Client,
+        pow_url: &str,
+        token: &str,
+    ) -> anyhow::Result<String> {
         let resp = Self::request(
-            &client,
+            client,
             reqwest::Method::POST,
             pow_url,
             Some(token),
@@ -174,7 +197,9 @@ impl DeepSeekProvider {
     /// `chat_session_id`, `model_type`, `parent_message_id` (null for fresh
     /// turns, int for follow-ups), `prompt`, `ref_file_ids`,
     /// `thinking_enabled`, `search_enabled`.
+    #[allow(clippy::too_many_arguments)]
     fn post_completion(
+        client: &reqwest::blocking::Client,
         completion_url: &str,
         token: &str,
         parent_message_id: Option<&str>,
@@ -183,7 +208,6 @@ impl DeepSeekProvider {
         model_type: &str,
         pow_header: Option<String>,
     ) -> anyhow::Result<(String, String)> {
-        let client = Self::http_client().context("failed to build HTTP client")?;
         let parent = parent_message_id
             .and_then(|s| s.trim().parse::<i64>().ok())
             .filter(|id| *id > 0);
@@ -198,7 +222,7 @@ impl DeepSeekProvider {
         });
 
         let mut rb = Self::request(
-            &client,
+            client,
             reqwest::Method::POST,
             completion_url,
             Some(token),
@@ -232,7 +256,13 @@ impl DeepSeekProvider {
             if line.is_empty() || !line.starts_with("data:") && !line.starts_with('{') {
                 continue;
             }
-            let json_str = line.strip_prefix("data: ").unwrap_or(line).trim();
+            // Accept both `data: {...}` and `data:{...}` — the space after
+            // the colon is optional (same convention as the claude parser).
+            let json_str = line
+                .strip_prefix("data:")
+                .map(|s| s.strip_prefix(' ').unwrap_or(s))
+                .unwrap_or(line)
+                .trim();
             if json_str == "[DONE]" {
                 continue;
             }
@@ -250,8 +280,9 @@ impl DeepSeekProvider {
             }
 
             // --- content patches ---
-            let path = v["p"].as_str().unwrap_or("").trim().to_string();
-            match path.as_str() {
+            // Borrow the path as &str — no per-line String alloc.
+            let path = v["p"].as_str().unwrap_or("").trim();
+            match path {
                 "response/content" | "content" => {
                     if let Some(s) = v["v"].as_str() {
                         content.push_str(s);
@@ -265,8 +296,10 @@ impl DeepSeekProvider {
                     // bare {"v": "text"} fragments and final response objects
                     if let Some(s) = v["v"].as_str() {
                         // a bare string v is only content when it is not a status word
-                        let upper = s.to_uppercase();
-                        if upper != "WIP" && upper != "FINISHED" && upper != "CONTENT_FILTER" {
+                        if !s.eq_ignore_ascii_case("WIP")
+                            && !s.eq_ignore_ascii_case("FINISHED")
+                            && !s.eq_ignore_ascii_case("CONTENT_FILTER")
+                        {
                             content.push_str(s);
                         }
                     } else if let Some(resp) = v["v"]["response"]
@@ -275,8 +308,8 @@ impl DeepSeekProvider {
                     {
                         if let Some(fragments) = resp.get("fragments").and_then(|f| f.as_array()) {
                             for frag in fragments {
-                                let t = frag["type"].as_str().unwrap_or("").to_uppercase();
-                                if matches!(t.as_str(), "RESPONSE" | "") {
+                                let t = frag["type"].as_str().unwrap_or("");
+                                if t.is_empty() || t.eq_ignore_ascii_case("RESPONSE") {
                                     if let Some(c) = frag["content"].as_str() {
                                         content.push_str(c);
                                     }
@@ -323,7 +356,8 @@ impl Provider for DeepSeekProvider {
                 "empty session token — copy your DeepSeek userToken and run 'chat-cli auth login deepseek --token ...'"
             );
         }
-        let ok = Self::probe_token(protocol::FETCH_SESSIONS_URL, token)?;
+        let client = Self::http_client().context("failed to build HTTP client")?;
+        let ok = Self::probe_token(&client, protocol::FETCH_SESSIONS_URL, token)?;
         Ok(Session {
             valid: ok,
             expiry: None,
@@ -382,16 +416,20 @@ impl DeepSeekProvider {
         completion_url: &str,
         token: &str,
     ) -> anyhow::Result<ChatResp> {
+        // One client for the whole turn — session create, PoW challenge and
+        // completion share the TLS session.
+        let client = Self::http_client().context("failed to build HTTP client")?;
+
         // --new: provision a server-side session first
         let chat_session_id = match &handle.conversation_id {
             Some(id) => id.clone(),
-            None => Self::create_chat_session(create_session_url, token)?,
+            None => Self::create_chat_session(&client, create_session_url, token)?,
         };
 
         // PoW is challenge-driven; ask once per completion. A missing/failed
         // challenge endpoint must not kill the chat: the server may not
         // require PoW at all.
-        let pow_header = Self::solve_completion_pow(pow_url, token)
+        let pow_header = Self::solve_completion_pow(&client, pow_url, token)
             .map(Some)
             .unwrap_or_else(|e| {
                 eprintln!("note: skipping deepseek PoW ({e})");
@@ -400,6 +438,7 @@ impl DeepSeekProvider {
 
         let parent_id = handle.parent_message_id.as_deref();
         let (content, message_id) = Self::post_completion(
+            &client,
             completion_url,
             token,
             parent_id,
@@ -412,11 +451,10 @@ impl DeepSeekProvider {
         Ok(ChatResp {
             content,
             conversation_id: chat_session_id,
-            message_id: if message_id.is_empty() {
-                format!("ds-{}", uuid::Uuid::new_v4())
-            } else {
-                message_id
-            },
+            // Empty when the stream carried no message id — a synthetic
+            // fallback would be persisted and then fail the i64 parse that
+            // builds parent_message_id on the next turn.
+            message_id,
         })
     }
 }
@@ -442,7 +480,12 @@ impl DeepSeekProvider {
     }
 
     fn probe_token_for_test(&self, base: &str, token: &str) -> anyhow::Result<bool> {
-        Self::probe_token(&format!("{base}/api/v0/chat_session/fetch_page"), token)
+        let client = Self::http_client().context("failed to build HTTP client")?;
+        Self::probe_token(
+            &client,
+            &format!("{base}/api/v0/chat_session/fetch_page"),
+            token,
+        )
     }
 
     fn parse_completion_for_test(&self, text: &str) -> anyhow::Result<(String, String)> {
@@ -514,6 +557,51 @@ mod tests {
             .probe_token_for_test(&url, "fake-token-xyz")
             .unwrap();
         assert!(!ok);
+    }
+
+    /// `code` may arrive as a numeric string — it must still read as an
+    /// auth rejection, not slip through as valid.
+    #[test]
+    fn auth_rejected_token_maps_string_code_to_invalid() {
+        let mut s = server();
+        s.mock(
+            "GET",
+            mockito::Matcher::Regex(r"^/api/v0/chat_session/fetch_page\?.*".to_string()),
+        )
+        .with_status(200)
+        .with_body(r#"{"code":"40003","msg":"Authorization Failed (invalid token)","data":null}"#)
+        .create();
+        let url = s.url();
+
+        let ok = DeepSeekProvider
+            .probe_token_for_test(&url, "fake-token")
+            .unwrap();
+        assert!(!ok);
+    }
+
+    /// A nonzero code that is NOT a known auth failure is a server-side
+    /// error — it must bail with the server message, not report the token
+    /// as rejected.
+    #[test]
+    fn auth_unknown_app_error_code_bails_as_server_error() {
+        let mut s = server();
+        s.mock(
+            "GET",
+            mockito::Matcher::Regex(r"^/api/v0/chat_session/fetch_page\?.*".to_string()),
+        )
+        .with_status(200)
+        .with_body(r#"{"code":50001,"msg":"internal shard error","data":null}"#)
+        .create();
+        let url = s.url();
+
+        let err = DeepSeekProvider
+            .probe_token_for_test(&url, "good-token")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("50001") && msg.contains("internal shard error"),
+            "{msg}"
+        );
     }
 
     #[test]

@@ -70,16 +70,23 @@ impl ClaudeProvider {
     }
 
     /// `GET /api/account` — validates the cookie (auth) and yields the org uuid.
-    fn fetch_org(account_url: &str, session_key: &str) -> anyhow::Result<String> {
-        let body = Self::fetch_account(account_url, session_key)?;
+    fn fetch_org(
+        client: &reqwest::blocking::Client,
+        account_url: &str,
+        session_key: &str,
+    ) -> anyhow::Result<String> {
+        let body = Self::fetch_account(client, account_url, session_key)?;
         protocol::extract_org_uuid(&body)
     }
 
     /// `GET /api/account` returning the raw body text — chat needs the
     /// settings section too (prior `paprika_mode` for restore).
-    fn fetch_account(account_url: &str, session_key: &str) -> anyhow::Result<String> {
-        let client = Self::http_client().context("failed to build HTTP client")?;
-        let resp = Self::request(&client, reqwest::Method::GET, account_url, session_key)
+    fn fetch_account(
+        client: &reqwest::blocking::Client,
+        account_url: &str,
+        session_key: &str,
+    ) -> anyhow::Result<String> {
+        let resp = Self::request(client, reqwest::Method::GET, account_url, session_key)
             .send()
             .with_context(|| format!("GET {account_url} failed — check network/proxy"))?;
 
@@ -100,11 +107,15 @@ impl ClaudeProvider {
     /// thinking switch). This mutates SERVER-SIDE account state shared with
     /// the user's claude.ai web session, so callers must restore the prior
     /// value after the turn.
-    fn set_paprika(base: &str, session_key: &str, mode: Value) -> anyhow::Result<()> {
-        let client = Self::http_client().context("failed to build HTTP client")?;
+    fn set_paprika(
+        client: &reqwest::blocking::Client,
+        base: &str,
+        session_key: &str,
+        mode: Value,
+    ) -> anyhow::Result<()> {
         let payload = protocol::build_account_settings(mode);
         let resp = Self::request(
-            &client,
+            client,
             reqwest::Method::PUT,
             &format!("{base}/api/account"),
             session_key,
@@ -121,12 +132,12 @@ impl ClaudeProvider {
 
     /// `POST .../chat_conversations` — create a conversation, return its uuid.
     fn create_conversation(
+        client: &reqwest::blocking::Client,
         create_url: &str,
         session_key: &str,
         model: &str,
     ) -> anyhow::Result<String> {
-        let client = Self::http_client().context("failed to build HTTP client")?;
-        let resp = Self::request(&client, reqwest::Method::POST, create_url, session_key)
+        let resp = Self::request(client, reqwest::Method::POST, create_url, session_key)
             .header("content-type", "application/json")
             .header("referer", format!("{}/new", protocol::BASE_URL))
             .json(&protocol::build_create_conversation(model))
@@ -148,15 +159,15 @@ impl ClaudeProvider {
     /// `POST .../completion` — stream one turn, return text + best-effort
     /// message uuid.
     fn post_completion(
+        client: &reqwest::blocking::Client,
         completion_url: &str,
         session_key: &str,
         conversation: &str,
         payload: Value,
     ) -> anyhow::Result<protocol::CompletionOutcome> {
-        let client = Self::http_client().context("failed to build HTTP client")?;
-        let resp = Self::request(&client, reqwest::Method::POST, completion_url, session_key)
+        let resp = Self::request(client, reqwest::Method::POST, completion_url, session_key)
             .header("content-type", "application/json")
-            .header("accept", "text/event-stream, text/event-stream")
+            .header("accept", "text/event-stream")
             .header("cache-control", "no-cache")
             .header(
                 "referer",
@@ -206,16 +217,21 @@ impl ClaudeProvider {
             None => prompt.to_string(),
         };
 
+        // One client for the whole turn — account fetch, paprika toggles,
+        // conversation create and completion all share the TLS session.
+        let client = Self::http_client().context("failed to build HTTP client")?;
+
         // One account fetch yields both the org uuid and the prior
         // paprika_mode we must restore after the turn.
-        let account_body = Self::fetch_account(&format!("{base}/api/account"), session_key)?;
+        let account_body =
+            Self::fetch_account(&client, &format!("{base}/api/account"), session_key)?;
         let account: Value =
             serde_json::from_str(&account_body).context("invalid JSON from /api/account")?;
         let org = protocol::extract_org_uuid_value(&account)?;
         let prior_paprika = account["settings"]["paprika_mode"].clone();
 
         if thinking {
-            Self::set_paprika(base, session_key, Value::String("extended".into()))
+            Self::set_paprika(&client, base, session_key, Value::String("extended".into()))
                 .context("failed to enable extended thinking on the account")?;
         }
 
@@ -227,6 +243,7 @@ impl ClaudeProvider {
             let conversation = match &handle.conversation_id {
                 Some(id) => id.clone(),
                 None => Self::create_conversation(
+                    &client,
                     &format!("{base}/api/organizations/{org}/chat_conversations"),
                     session_key,
                     model,
@@ -234,6 +251,7 @@ impl ClaudeProvider {
             };
 
             let outcome = Self::post_completion(
+                &client,
                 &format!(
                     "{base}/api/organizations/{org}/chat_conversations/{conversation}/completion"
                 ),
@@ -268,7 +286,7 @@ impl ClaudeProvider {
             } else {
                 prior_paprika
             };
-            if let Err(e) = Self::set_paprika(base, session_key, restore) {
+            if let Err(e) = Self::set_paprika(&client, base, session_key, restore) {
                 eprintln!(
                     "warning: could not restore claude.ai thinking mode after the turn — \
                      check Settings on claude.ai ({e})"
@@ -297,7 +315,8 @@ impl Provider for ClaudeProvider {
                  Cookies) and run 'chat-cli auth login claude'"
             );
         }
-        let org = Self::fetch_org(protocol::organizations_url().as_str(), token)?;
+        let client = Self::http_client().context("failed to build HTTP client")?;
+        let org = Self::fetch_org(&client, protocol::organizations_url().as_str(), token)?;
         Ok(Session {
             valid: !org.is_empty(),
             expiry: None,
@@ -339,7 +358,8 @@ inventory::submit!(chat_core::provider::ProviderEntry {
 #[cfg(test)]
 impl ClaudeProvider {
     fn fetch_org_for_test(&self, base: &str, session_key: &str) -> anyhow::Result<String> {
-        Self::fetch_org(&format!("{base}/api/account"), session_key)
+        let client = Self::http_client().context("failed to build HTTP client")?;
+        Self::fetch_org(&client, &format!("{base}/api/account"), session_key)
     }
 
     fn chat_at_for_test(
